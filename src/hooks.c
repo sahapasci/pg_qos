@@ -338,9 +338,7 @@ qos_validate_qos_setstmt(VariableSetStmt *stmt)
     {
         ereport(ERROR,
                 (errmsg("qos: invalid parameter name \"%s\"", stmt->name),
-                 errhint("Valid parameters: qos.work_mem_limit, qos.cpu_core_limit, qos.max_concurrent_tx, "
-                         "qos.max_concurrent_select, qos.max_concurrent_update, qos.max_concurrent_delete, "
-                 "qos.max_concurrent_insert, qos.work_mem_error_level")));
+                 errhint("%s", qos_valid_param_hint)));
     }
 
     if (strcmp(stmt->name, "qos.enabled") == 0)

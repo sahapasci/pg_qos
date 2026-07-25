@@ -61,13 +61,37 @@ static void qos_shmem_request(void);
 static void qos_shmem_startup(void);
 static void parse_role_configs(ArrayType *configs, QoSLimits *limits);
 
-static const char *qos_valid_param_hint =
+const char *qos_valid_param_hint =
     "Valid parameters: qos.work_mem_limit, qos.cpu_core_limit, "
     "qos.max_concurrent_tx, qos.max_concurrent_select, "
     "qos.max_concurrent_update, qos.max_concurrent_delete, "
-    "qos.max_concurrent_insert, qos.work_mem_error_level";
+    "qos.max_concurrent_insert, qos.work_mem_error_level, "
+    "qos.max_tx_rate, qos.max_tx_rate_window, "
+    "qos.max_select_rate, qos.max_select_rate_window, "
+    "qos.max_update_rate, qos.max_update_rate_window, "
+    "qos.max_delete_rate, qos.max_delete_rate_window, "
+    "qos.max_insert_rate, qos.max_insert_rate_window";
+
+/*
+ * Parameter names for the time-windowed (rate) limits, indexed by QoSRateKind.
+ * Each limit is configured as a separate count/window parameter pair.
+ */
+static const struct
+{
+    const char *count_name;
+    const char *window_name;
+} qos_rate_params[QOS_RATE_NKINDS] = {
+    {"qos.max_tx_rate",     "qos.max_tx_rate_window"},
+    {"qos.max_select_rate", "qos.max_select_rate_window"},
+    {"qos.max_update_rate", "qos.max_update_rate_window"},
+    {"qos.max_delete_rate", "qos.max_delete_rate_window"},
+    {"qos.max_insert_rate", "qos.max_insert_rate_window"}
+};
 
 static char *qos_trim_whitespace(char *str);
+static bool qos_lookup_rate_param(const char *name, int *kind, bool *is_window);
+static bool qos_parse_duration_value(const char *value_str, int *out_ms,
+                                     const char *param_name, bool strict);
 static bool qos_parse_int32_value(const char *value_str, int *out,
                                   int min_value, int max_value,
                                   bool allow_negative_one,
@@ -89,7 +113,7 @@ PG_FUNCTION_INFO_V1(qos_reset_stats);
 Datum
 qos_version(PG_FUNCTION_ARGS)
 {
-    PG_RETURN_TEXT_P(cstring_to_text("PostgreSQL QoS Resource Governor 1.0"));
+    PG_RETURN_TEXT_P(cstring_to_text("PostgreSQL QoS Resource Governor 1.1"));
 }
 
 Datum
@@ -128,6 +152,13 @@ qos_shmem_request(void)
     
     RequestAddinShmemSpace(MAXALIGN(size));
     RequestNamedLWLockTranche("qos", 1);
+
+    /*
+     * Separate tranche for the rate limiter.  Sharing the "qos" lock would
+     * serialise every rate check behind the O(max_backends) backend_status
+     * scan performed for the concurrency limits.
+     */
+    RequestNamedLWLockTranche("qos_rate", QOS_RATE_LOCK_STRIPES);
 }
 
 /*
@@ -159,6 +190,7 @@ qos_shmem_startup(void)
         /* Initialize shared state */
         memset(qos_shared_state, 0, size);
         qos_shared_state->lock = &(GetNamedLWLockTranche("qos")->lock);
+        qos_shared_state->rate_locks = GetNamedLWLockTranche("qos_rate");
         qos_shared_state->settings_epoch = 0;
         qos_shared_state->next_cpu_core = 0;
         qos_shared_state->max_backends = MaxBackends;
@@ -171,6 +203,14 @@ qos_shmem_startup(void)
             qos_shared_state->affinity_entries[i].num_cores = 0;
         }
         
+        /* Initialize rate limiter slots (InvalidOid marks a free slot) */
+        for (i = 0; i < QOS_MAX_RATE_ENTRIES; i++)
+        {
+            qos_shared_state->rate_slots[i].entry.database_oid = InvalidOid;
+            qos_shared_state->rate_slots[i].entry.role_oid = InvalidOid;
+            qos_shared_state->rate_slots[i].entry.kind = -1;
+        }
+
         /* Initialize backend status array */
         for (i = 0; i < MaxBackends; i++)
         {
@@ -239,6 +279,150 @@ parse_role_configs(ArrayType *configs, QoSLimits *limits)
 
     pfree(elems);
     pfree(nulls);
+}
+
+/*
+ * Reset every limit to "unset".
+ *
+ * Kept in one place so that adding a field to QoSLimits cannot silently leave
+ * one of the three catalog lookups (role / database / role+database)
+ * initialising garbage.
+ */
+void
+qos_limits_init_unset(QoSLimits *limits)
+{
+    int i;
+
+    if (limits == NULL)
+        return;
+
+    limits->work_mem_limit = -1;
+    limits->cpu_core_limit = -1;
+    limits->max_concurrent_tx = -1;
+    limits->max_concurrent_select = -1;
+    limits->max_concurrent_update = -1;
+    limits->max_concurrent_delete = -1;
+    limits->max_concurrent_insert = -1;
+    limits->work_mem_error_level = -1;
+
+    for (i = 0; i < QOS_RATE_NKINDS; i++)
+    {
+        limits->max_rate[i] = -1;
+        limits->max_rate_window_ms[i] = -1;
+    }
+}
+
+/*
+ * Map a qos.max_*_rate[_window] parameter name to its kind.
+ * Returns false if the name is not a rate parameter.
+ */
+static bool
+qos_lookup_rate_param(const char *name, int *kind, bool *is_window)
+{
+    int i;
+
+    if (name == NULL)
+        return false;
+
+    for (i = 0; i < QOS_RATE_NKINDS; i++)
+    {
+        if (strcmp(name, qos_rate_params[i].count_name) == 0)
+        {
+            *kind = i;
+            *is_window = false;
+            return true;
+        }
+        if (strcmp(name, qos_rate_params[i].window_name) == 0)
+        {
+            *kind = i;
+            *is_window = true;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/*
+ * Parse a rate window: an integer with an optional ms/s/min suffix.
+ * A bare number is interpreted as milliseconds.  -1 means "unset".
+ *
+ * The lower bound exists to stop nonsensical configurations, not for
+ * performance reasons: token-bucket refill is lazy, so a 100ms window costs
+ * exactly as much CPU per check as a 1 hour window.
+ */
+static bool
+qos_parse_duration_value(const char *value_str, int *out_ms,
+                         const char *param_name, bool strict)
+{
+    char *endptr;
+    long base;
+    int64 multiplier = 1;
+    int64 result;
+    const char *suffix;
+
+    if (value_str == NULL || *value_str == '\0')
+        goto invalid;
+
+    errno = 0;
+    base = strtol(value_str, &endptr, 10);
+    if (endptr == value_str || errno == ERANGE)
+        goto invalid;
+
+    suffix = endptr;
+    while (*suffix != '\0' && isspace((unsigned char) *suffix))
+        suffix++;
+
+    if (*suffix != '\0')
+    {
+        if (pg_strcasecmp(suffix, "ms") == 0)
+            multiplier = 1;
+        else if (pg_strcasecmp(suffix, "s") == 0 || pg_strcasecmp(suffix, "sec") == 0)
+            multiplier = 1000;
+        else if (pg_strcasecmp(suffix, "min") == 0)
+            multiplier = 60 * 1000;
+        else
+            goto invalid;
+    }
+
+    /* -1 disables the setting; it must not carry a unit */
+    if (base == -1 && *suffix == '\0')
+    {
+        if (out_ms)
+            *out_ms = -1;
+        return true;
+    }
+
+    if (base < 0)
+        goto invalid;
+
+    result = (int64) base * multiplier;
+
+    if (result < QOS_RATE_WINDOW_MIN_MS || result > QOS_RATE_WINDOW_MAX_MS)
+    {
+        if (strict)
+            ereport(ERROR,
+                    (errmsg("qos: invalid value for %s: \"%s\"", param_name, value_str),
+                     errdetail("Window must be between %d ms and %d ms.",
+                               QOS_RATE_WINDOW_MIN_MS, QOS_RATE_WINDOW_MAX_MS)));
+        else
+            elog(DEBUG1, "qos: out-of-range value for %s: \"%s\" (ignored)",
+                 param_name, value_str);
+        return false;
+    }
+
+    if (out_ms)
+        *out_ms = (int) result;
+    return true;
+
+invalid:
+    if (strict)
+        ereport(ERROR,
+                (errmsg("qos: invalid value for %s: \"%s\"", param_name, value_str),
+                 errdetail("Expected a duration with optional unit (ms, s, min) or -1.")));
+    else
+        elog(DEBUG1, "qos: invalid value for %s: \"%s\" (ignored)", param_name, value_str);
+    return false;
 }
 
 static char *
@@ -387,8 +571,14 @@ invalid:
 static bool
 qos_is_valid_qos_param_name_internal(const char *name)
 {
+    int kind;
+    bool is_window;
+
     if (name == NULL)
         return false;
+
+    if (qos_lookup_rate_param(name, &kind, &is_window))
+        return true;
 
     if (strcmp(name, "qos.work_mem_limit") == 0)
         return true;
@@ -426,6 +616,8 @@ qos_apply_qos_param_value(QoSLimits *limits, const char *name,
     int64 parsed_mem = -1;
     char *value_copy = NULL;
     char *trimmed_value = NULL;
+    int rate_kind = 0;
+    bool rate_is_window = false;
 
     if (name == NULL)
         return false;
@@ -459,6 +651,34 @@ qos_apply_qos_param_value(QoSLimits *limits, const char *name,
 
     value_copy = pstrdup(value);
     trimmed_value = qos_trim_whitespace(value_copy);
+
+    /* Time-windowed (rate) limits: count and window are separate parameters */
+    if (qos_lookup_rate_param(name, &rate_kind, &rate_is_window))
+    {
+        if (rate_is_window)
+        {
+            if (!qos_parse_duration_value(trimmed_value, &parsed_int, name, strict))
+            {
+                pfree(value_copy);
+                return false;
+            }
+            if (limits)
+                limits->max_rate_window_ms[rate_kind] = parsed_int;
+        }
+        else
+        {
+            if (!qos_parse_int32_value(trimmed_value, &parsed_int, 0, INT_MAX, true,
+                                       name, strict))
+            {
+                pfree(value_copy);
+                return false;
+            }
+            if (limits)
+                limits->max_rate[rate_kind] = parsed_int;
+        }
+        pfree(value_copy);
+        return true;
+    }
 
     if (strcmp(name, "qos.work_mem_limit") == 0)
     {
@@ -584,14 +804,7 @@ qos_get_role_limits(Oid roleId)
     HeapTuple tuple;
     
     /* Set defaults */
-    limits.work_mem_limit = -1;
-    limits.cpu_core_limit = -1;
-    limits.max_concurrent_tx = -1;    
-    limits.max_concurrent_select = -1;
-    limits.max_concurrent_update = -1;
-    limits.max_concurrent_delete = -1;
-    limits.max_concurrent_insert = -1;
-    limits.work_mem_error_level = -1;
+    qos_limits_init_unset(&limits);
     
     /* Open pg_db_role_setting catalog */
     pg_db_role_setting_rel = table_open(DbRoleSettingRelationId, AccessShareLock);
@@ -648,14 +861,7 @@ qos_get_database_limits(Oid dbId)
     HeapTuple tuple;
     
     /* Set defaults */
-    limits.work_mem_limit = -1;
-    limits.cpu_core_limit = -1;
-    limits.max_concurrent_tx = -1;    
-    limits.max_concurrent_select = -1;
-    limits.max_concurrent_update = -1;
-    limits.max_concurrent_delete = -1;
-    limits.max_concurrent_insert = -1;
-    limits.work_mem_error_level = -1;
+    qos_limits_init_unset(&limits);
     
     /* Open pg_db_role_setting catalog */
     pg_db_role_setting_rel = table_open(DbRoleSettingRelationId, AccessShareLock);
@@ -713,14 +919,7 @@ qos_get_role_db_limits(Oid roleId, Oid dbId)
     HeapTuple tuple;
     
     /* Set defaults */
-    limits.work_mem_limit = -1;
-    limits.cpu_core_limit = -1;
-    limits.max_concurrent_tx = -1;    
-    limits.max_concurrent_select = -1;
-    limits.max_concurrent_update = -1;
-    limits.max_concurrent_delete = -1;
-    limits.max_concurrent_insert = -1;
-    limits.work_mem_error_level = -1;
+    qos_limits_init_unset(&limits);
     
     /* Skip if either OID is invalid */
     if (!OidIsValid(roleId) || !OidIsValid(dbId))

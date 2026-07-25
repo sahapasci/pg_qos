@@ -36,25 +36,47 @@ qos_track_statement_start(CmdType operation)
     int count = 0;
     int i;
     int limit_val = -1;
+    int rate_kind = -1;
+    int rate_count;
+    int rate_window;
+    int retry_after_ms = 0;
 #ifndef MyBackendId
     int my_slot = -1;
 #endif
-    
+
     if (!qos_enabled || statement_tracked)
-        return;    
-    
+        return;
+
     limits = qos_get_cached_limits();
-    
-    /* Determine which limit applies */
+
+    /* Determine which limits apply */
     switch (operation)
     {
-        case CMD_SELECT: limit_val = limits.max_concurrent_select; break;
-        case CMD_UPDATE: limit_val = limits.max_concurrent_update; break;
-        case CMD_DELETE: limit_val = limits.max_concurrent_delete; break;
-        case CMD_INSERT: limit_val = limits.max_concurrent_insert; break;
+        case CMD_SELECT:
+            limit_val = limits.max_concurrent_select;
+            rate_kind = QOS_RATE_SELECT;
+            break;
+        case CMD_UPDATE:
+            limit_val = limits.max_concurrent_update;
+            rate_kind = QOS_RATE_UPDATE;
+            break;
+        case CMD_DELETE:
+            limit_val = limits.max_concurrent_delete;
+            rate_kind = QOS_RATE_DELETE;
+            break;
+        case CMD_INSERT:
+            limit_val = limits.max_concurrent_insert;
+            rate_kind = QOS_RATE_INSERT;
+            break;
         default: return;
     }
-    
+
+    /* A rate count without an explicit window falls back to the default */
+    rate_count = limits.max_rate[rate_kind];
+    rate_window = limits.max_rate_window_ms[rate_kind];
+    if (rate_count > 0 && rate_window <= 0)
+        rate_window = QOS_RATE_WINDOW_DEFAULT_MS;
+
     if (qos_shared_state)
     {
 #ifndef MyBackendId
@@ -134,6 +156,32 @@ qos_track_statement_start(CmdType operation)
         /* Only set tracking flags after successful registration */
         current_statement_type = operation;
         statement_tracked = true;
+
+        /*
+         * Rate check runs after the concurrency check so that a statement
+         * already rejected for concurrency does not burn a token.  On
+         * rejection we undo our registration first, otherwise the slot would
+         * stay marked as running this command type.
+         */
+        if (rate_count > 0 &&
+            !qos_rate_check(rate_kind, rate_count, rate_window, &retry_after_ms))
+        {
+            qos_track_statement_end();
+
+            LWLockAcquire(qos_shared_state->lock, LW_EXCLUSIVE);
+            qos_shared_state->stats.rate_violations[rate_kind]++;
+            qos_shared_state->stats.rejected_queries++;
+            LWLockRelease(qos_shared_state->lock);
+
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("qos: %s rate limit exceeded",
+                            qos_rate_kind_name(rate_kind)),
+                     errdetail("Maximum %d %s statements per %d ms.",
+                               rate_count, qos_rate_kind_name(rate_kind),
+                               rate_window),
+                     errhint("Retry after approximately %d ms.", retry_after_ms)));
+        }
     }
 }
 

@@ -32,6 +32,8 @@ extern void qos_init_cache(void);
 extern void qos_track_statement_start(CmdType operation);
 extern void qos_track_statement_end(void);
 
+/* Rate limit enforcement (hooks_rate.c) - see qos.h for prototypes */
+
 /* Transaction tracking functions (hooks_transaction.c) */
 extern void qos_track_transaction_start(void);
 extern void qos_track_transaction_end(void);

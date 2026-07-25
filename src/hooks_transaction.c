@@ -32,17 +32,33 @@ qos_track_transaction_start(void)
     QoSLimits limits;
     int count = 0;
     int i;
+    int rate_count;
+    int rate_window;
+    int retry_after_ms = 0;
 #ifndef MyBackendId
     int my_slot = -1;
 #endif
-    
+
     if (!qos_enabled || transaction_tracked)
         return;
-    
+
     /* Get cached limits - no catalog access needed */
     limits = qos_get_cached_limits();
-    
-    if (qos_shared_state && limits.max_concurrent_tx > 0)
+
+    /* A rate count without an explicit window falls back to the default */
+    rate_count = limits.max_rate[QOS_RATE_TX];
+    rate_window = limits.max_rate_window_ms[QOS_RATE_TX];
+    if (rate_count > 0 && rate_window <= 0)
+        rate_window = QOS_RATE_WINDOW_DEFAULT_MS;
+
+    if (!qos_shared_state)
+        return;
+
+    /* Nothing configured - skip the shared memory work entirely */
+    if (limits.max_concurrent_tx <= 0 && rate_count <= 0)
+        return;
+
+    if (limits.max_concurrent_tx > 0)
     {
 #ifndef MyBackendId
     my_slot = qos_get_backend_slot(true);
@@ -104,9 +120,61 @@ qos_track_transaction_start(void)
     #endif
         
         LWLockRelease(qos_shared_state->lock);
-        
+
         /* Only set tracking flag after successful increment */
         transaction_tracked = true;
+    }
+    else
+    {
+        /*
+         * Rate limit configured without a concurrency limit: still claim a
+         * slot and mark ourselves in-transaction, so that a concurrency limit
+         * added later (and qos_track_transaction_end) sees consistent state.
+         */
+#ifndef MyBackendId
+        my_slot = qos_get_backend_slot(true);
+#endif
+        LWLockAcquire(qos_shared_state->lock, LW_EXCLUSIVE);
+#ifndef MyBackendId
+        if (my_slot >= 0)
+        {
+            qos_shared_state->backend_status[my_slot].role_oid = GetUserId();
+            qos_shared_state->backend_status[my_slot].database_oid = MyDatabaseId;
+            qos_shared_state->backend_status[my_slot].in_transaction = true;
+        }
+#else
+        qos_shared_state->backend_status[MyBackendId - 1].pid = MyProcPid;
+        qos_shared_state->backend_status[MyBackendId - 1].role_oid = GetUserId();
+        qos_shared_state->backend_status[MyBackendId - 1].database_oid = MyDatabaseId;
+        qos_shared_state->backend_status[MyBackendId - 1].in_transaction = true;
+#endif
+        LWLockRelease(qos_shared_state->lock);
+
+        transaction_tracked = true;
+    }
+
+    /*
+     * Rate check runs after the concurrency check so that a transaction
+     * already rejected for concurrency does not burn a token.  On rejection
+     * we undo our registration before raising, otherwise the slot would stay
+     * marked in-transaction for the rest of the session.
+     */
+    if (rate_count > 0 &&
+        !qos_rate_check(QOS_RATE_TX, rate_count, rate_window, &retry_after_ms))
+    {
+        qos_track_transaction_end();
+
+        LWLockAcquire(qos_shared_state->lock, LW_EXCLUSIVE);
+        qos_shared_state->stats.rate_violations[QOS_RATE_TX]++;
+        qos_shared_state->stats.rejected_queries++;
+        LWLockRelease(qos_shared_state->lock);
+
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("qos: transaction rate limit exceeded"),
+                 errdetail("Maximum %d transactions per %d ms.",
+                           rate_count, rate_window),
+                 errhint("Retry after approximately %d ms.", retry_after_ms)));
     }
 }
 
