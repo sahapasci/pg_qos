@@ -25,6 +25,7 @@
 #include "hooks_internal.h"
 #include "miscadmin.h"
 #include "portability/instr_time.h"
+#include "port/atomics.h"
 #include "storage/lwlock.h"
 
 /*
@@ -134,25 +135,42 @@ qos_rate_find_slot(Oid database_oid, Oid role_oid, int kind, int initial_tokens)
         bool claimed = false;
 
         /*
-         * Scan for an existing entry.  Reads are done without a lock: the key
-         * fields are only ever written once, under a lock, while the slot is
-         * being claimed, and database_oid is written last.  A racing reader
-         * can therefore only fail to see a new entry, never see a half-built
-         * one - and that case is caught by the re-check under the lock below.
+         * Scan for an existing entry without taking a lock.  The key fields
+         * are written exactly once, under a lock, and database_oid is stored
+         * last behind a write barrier - so a valid database_oid implies the
+         * rest of the key is already visible.  The matching read barrier
+         * below is what makes that hold on weakly ordered architectures
+         * (aarch64, ppc64); without it a reader could see the published
+         * database_oid alongside a stale role_oid or kind and either miss the
+         * entry or match the wrong one.
+         *
+         * A missed match is still possible if the entry is published mid-scan;
+         * that case is caught by the re-check under the lock below.
          */
         for (i = 0; i < QOS_MAX_RATE_ENTRIES; i++)
         {
-            e = &qos_shared_state->rate_slots[i].entry;
+            Oid slot_db;
 
-            if (e->database_oid == database_oid && e->role_oid == role_oid &&
-                e->kind == kind)
+            e = &qos_shared_state->rate_slots[i].entry;
+            slot_db = e->database_oid;
+
+            if (slot_db == InvalidOid)
+            {
+                if (free_slot < 0)
+                    free_slot = i;
+                continue;
+            }
+
+            if (slot_db != database_oid)
+                continue;
+
+            pg_read_barrier();
+
+            if (e->role_oid == role_oid && e->kind == kind)
             {
                 cached_rate_slot[kind] = i;
                 return i;
             }
-
-            if (free_slot < 0 && e->database_oid == InvalidOid)
-                free_slot = i;
         }
 
         if (free_slot < 0)
@@ -182,7 +200,12 @@ qos_rate_find_slot(Oid database_oid, Oid role_oid, int kind, int initial_tokens)
             e->rejected = 0;
             e->kind = kind;
             e->role_oid = role_oid;
-            /* Written last: this is what publishes the slot to readers */
+
+            /*
+             * Publish last, behind a write barrier: lock-free readers key off
+             * database_oid, so every other field must be visible before it is.
+             */
+            pg_write_barrier();
             e->database_oid = database_oid;
             claimed = true;
         }

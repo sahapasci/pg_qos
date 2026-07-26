@@ -140,6 +140,39 @@ Configure limits per role and/or per database using standard GUC storage in `pg_
 - `qos.max_concurrent_delete` (integer) — max concurrent DELETE statement
 - `qos.max_concurrent_insert` (integer) — max concurrent INSERT statement
 
+### Rate limits (time-windowed)
+
+The `max_concurrent_*` settings above cap how many operations run *at the same
+time*; they do not cap how *fast* operations arrive. A single backend can run
+50,000 SELECTs per second while never exceeding `max_concurrent_select = 1`.
+
+The rate limits below cap throughput: "at most N operations per W
+milliseconds", counted per `(database, role)` across all backends. Each limit
+is a pair of settings — a count and a window:
+
+| Count | Window | Meaning |
+| --- | --- | --- |
+| `qos.max_tx_rate` | `qos.max_tx_rate_window` | transactions per window |
+| `qos.max_select_rate` | `qos.max_select_rate_window` | SELECTs per window |
+| `qos.max_update_rate` | `qos.max_update_rate_window` | UPDATEs per window |
+| `qos.max_delete_rate` | `qos.max_delete_rate_window` | DELETEs per window |
+| `qos.max_insert_rate` | `qos.max_insert_rate_window` | INSERTs per window |
+
+- `-1` (the default) disables the limit, so behaviour is unchanged until you
+  set one.
+- Windows accept `ms`, `s` and `min` suffixes; a bare number means
+  milliseconds. The minimum is **100 ms**, the maximum 1 day.
+- Setting a count without a window uses a default window of `1s`. Setting a
+  window without a count does nothing.
+- Exceeding a limit raises `ERROR` with SQLSTATE `54000`
+  (`program_limit_exceeded`), the same as the concurrency limits. The hint
+  reports roughly how long to wait before retrying.
+
+Prefer a larger count over a shorter window when the two express the same
+average rate: `100/1s` and `10/100ms` both allow ~100/sec, but the smaller
+count rejects far more legitimate traffic to natural jitter. Aim for a count
+of at least ~20.
+
 Examples:
 
 ```sql
@@ -154,9 +187,17 @@ ALTER DATABASE appdb SET qos.max_concurrent_tx = '200';
 -- Per-role limits for a specific database
 ALTER ROLE app_user IN database appdb SET qos.work_mem_limit = '4MB';
 ALTER ROLE app_user IN database appdb SET qos.max_concurrent_update = '10';
+
+-- Rate limits: at most 100 transactions per second, 10 SELECTs per 500 ms
+ALTER ROLE app_user SET qos.max_tx_rate = '100';
+ALTER ROLE app_user SET qos.max_tx_rate_window = '1s';
+ALTER ROLE app_user SET qos.max_select_rate = '10';
+ALTER ROLE app_user SET qos.max_select_rate_window = '500ms';
 ```
 
 Effective limits are the most restrictive combination of role-level and database-level settings.
+Rate limits are merged as whole `(count, window)` pairs by comparing normalised
+rates, so `10/1s` (10/sec) wins over `100/500ms` (200/sec).
 
 ## How it works
 
@@ -171,6 +212,13 @@ Effective limits are the most restrictive combination of role-level and database
 - Concurrency limits
   - Executor hooks track active transactions and statements per command type; caps are enforced against configured maxima.
 
+- Rate limits
+  - Each `(database, role, operation)` gets a token bucket in shared memory, refilled lazily: a check adds `elapsed * (count / window)` tokens and then consumes one.
+  - Nothing runs periodically, so the CPU cost of a check does not depend on the window length — a 100 ms window costs the same as a one hour window. The check itself is O(1) and measurably cheaper than the concurrency scan that already runs per statement.
+  - A fresh bucket starts full, so an idle system has its whole burst allowance available.
+  - Timing uses a monotonic clock, so an NTP step backwards cannot stall a limit.
+  - Fails open: if the shared slot table (512 entries) is exhausted, a warning is logged and traffic is allowed rather than blocked.
+
 
 ## Observability and Logging
 
@@ -181,6 +229,24 @@ SET client_min_messages = 'debug1';
 ```
 
 You’ll see messages when cache is refreshed, CPU workers are adjusted, or limits are enforced.
+
+## Upgrading to 1.1
+
+Version 1.1 adds the rate limits and grows the extension's shared memory
+state, so `ALTER EXTENSION` alone is not enough — the new module must be
+loaded by a restarted postmaster:
+
+```bash
+make && sudo make install
+pg_ctl restart          # required: shared memory layout changed
+```
+
+```sql
+ALTER EXTENSION qos UPDATE TO '1.1';
+```
+
+Existing `qos.*` settings are unaffected and no rate limit is active until you
+set one, so the upgrade is behaviour-neutral by default.
 
 ## Limitations
 
@@ -206,6 +272,7 @@ Remove from `shared_preload_libraries` and restart the server.
   - `hooks_resource.c`: CPU/memory enforcement + planner hook
   - `hooks_statement.c`: statement-level concurrency tracking
   - `hooks_transaction.c`: transaction-level concurrency tracking
+  - `hooks_rate.c`: time-windowed (rate) limits — token buckets in shared memory
   - `qos.c`/`qos.h`: shared memory, catalog reads, helpers
 
 ## License
