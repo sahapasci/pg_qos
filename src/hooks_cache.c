@@ -162,6 +162,76 @@ qos_pick_min_rate(int *out_count, int *out_window,
 }
 
 /*
+ * Resolve the effective limits for an arbitrary (role, database) pair.
+ *
+ * Callable for any pair, not just the current session: the statistics views
+ * use it to report the limit alongside each token bucket, and it works across
+ * databases because pg_db_role_setting is a shared catalog.
+ */
+void
+qos_compute_effective_limits(Oid roleId, Oid dbId, QoSLimits *out)
+{
+    QoSLimits role_limits;
+    QoSLimits db_limits;
+    QoSLimits role_db_limits;
+    int k;
+
+    qos_limits_init_unset(out);
+
+    /* Query catalogs for all 3 possible setting scopes */
+    role_limits = qos_get_role_limits(roleId);
+    db_limits = qos_get_database_limits(dbId);
+    role_db_limits = qos_get_role_db_limits(roleId, dbId);
+
+    /*
+     * Calculate limits (most restrictive wins).
+     * Three sources:
+     *   role_limits    = ALTER ROLE x SET qos.*           (db=0, role=X)
+     *   db_limits      = ALTER DATABASE y SET qos.*       (db=Y, role=0)
+     *   role_db_limits = ALTER ROLE x IN DATABASE y SET   (db=Y, role=X)
+     * Take the minimum of all that are set (>= 0).
+     */
+    #define PICK_MIN(a, b) \
+        ((a) >= 0 && (b) >= 0 ? Min((a), (b)) : ((a) >= 0 ? (a) : (b)))
+
+    #define CALC_LIMIT(field) \
+        do { \
+            int64 _tmp = PICK_MIN(role_limits.field, db_limits.field); \
+            out->field = PICK_MIN(_tmp, role_db_limits.field); \
+        } while (0)
+
+    CALC_LIMIT(work_mem_limit);
+    CALC_LIMIT(cpu_core_limit);
+    CALC_LIMIT(max_concurrent_tx);
+    CALC_LIMIT(max_concurrent_select);
+    CALC_LIMIT(max_concurrent_update);
+    CALC_LIMIT(max_concurrent_delete);
+    CALC_LIMIT(max_concurrent_insert);
+    CALC_LIMIT(work_mem_error_level);
+
+    #undef CALC_LIMIT
+    #undef PICK_MIN
+
+    /* Rate limits merge as (count, window) pairs - see qos_pick_min_rate */
+    for (k = 0; k < QOS_RATE_NKINDS; k++)
+    {
+        int c, w;
+
+        qos_pick_min_rate(&c, &w,
+                          role_limits.max_rate[k],
+                          role_limits.max_rate_window_ms[k],
+                          db_limits.max_rate[k],
+                          db_limits.max_rate_window_ms[k]);
+        qos_pick_min_rate(&c, &w, c, w,
+                          role_db_limits.max_rate[k],
+                          role_db_limits.max_rate_window_ms[k]);
+
+        out->max_rate[k] = c;
+        out->max_rate_window_ms[k] = w;
+    }
+}
+
+/*
  * Initialize or refresh cached limits for current session
  * Cache is automatically invalidated via syscache callback when configs change
  */
@@ -170,12 +240,10 @@ qos_refresh_cached_limits(void)
 {
     Oid current_user_id;
     Oid current_db_id;
-    QoSLimits role_limits;
-    QoSLimits db_limits;
-    
+
     current_user_id = GetUserId();
     current_db_id = MyDatabaseId;
-    
+
     /* If shared settings epoch changed, force invalidate */
     if (qos_shared_state && last_seen_epoch != qos_shared_state->settings_epoch)
     {
@@ -188,66 +256,8 @@ qos_refresh_cached_limits(void)
     /* If cache still valid for same user/db, return */
     if (limits_cached && cached_user_id == current_user_id && cached_db_id == current_db_id)
         return;
-    
-    /* Refresh cache - query catalogs for all 3 possible setting scopes */
-    role_limits = qos_get_role_limits(current_user_id);
-    db_limits = qos_get_database_limits(current_db_id);
-    
-    {
-        QoSLimits role_db_limits;
-        role_db_limits = qos_get_role_db_limits(current_user_id, current_db_id);
 
-        /*
-         * Calculate limits (most restrictive wins).
-         * Three sources:
-         *   role_limits    = ALTER ROLE x SET qos.*           (db=0, role=X)
-         *   db_limits      = ALTER DATABASE y SET qos.*       (db=Y, role=0)
-         *   role_db_limits = ALTER ROLE x IN DATABASE y SET   (db=Y, role=X)
-         * Take the minimum of all that are set (>= 0).
-         */
-        #define PICK_MIN(a, b) \
-            ((a) >= 0 && (b) >= 0 ? Min((a), (b)) : ((a) >= 0 ? (a) : (b)))
-        
-        #define CALC_LIMIT(field) \
-            do { \
-                int64 _tmp = PICK_MIN(role_limits.field, db_limits.field); \
-                cached_limits.field = PICK_MIN(_tmp, role_db_limits.field); \
-            } while (0)
-        
-        CALC_LIMIT(work_mem_limit);
-        CALC_LIMIT(cpu_core_limit);
-        CALC_LIMIT(max_concurrent_tx);
-        CALC_LIMIT(max_concurrent_select);
-        CALC_LIMIT(max_concurrent_update);
-        CALC_LIMIT(max_concurrent_delete);
-        CALC_LIMIT(max_concurrent_insert);
-        CALC_LIMIT(work_mem_error_level);
-
-        #undef CALC_LIMIT
-        #undef PICK_MIN
-
-        /* Rate limits merge as (count, window) pairs - see qos_pick_min_rate */
-        {
-            int k;
-
-            for (k = 0; k < QOS_RATE_NKINDS; k++)
-            {
-                int c, w;
-
-                qos_pick_min_rate(&c, &w,
-                                  role_limits.max_rate[k],
-                                  role_limits.max_rate_window_ms[k],
-                                  db_limits.max_rate[k],
-                                  db_limits.max_rate_window_ms[k]);
-                qos_pick_min_rate(&c, &w, c, w,
-                                  role_db_limits.max_rate[k],
-                                  role_db_limits.max_rate_window_ms[k]);
-
-                cached_limits.max_rate[k] = c;
-                cached_limits.max_rate_window_ms[k] = w;
-            }
-        }
-    }
+    qos_compute_effective_limits(current_user_id, current_db_id, &cached_limits);
 
     /*
      * Note: token buckets in shared memory are intentionally NOT reset here.
