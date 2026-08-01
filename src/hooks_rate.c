@@ -29,24 +29,13 @@
 #include "storage/lwlock.h"
 
 /*
- * Backend-local slot cache.
- *
- * Without this every check would scan QOS_MAX_RATE_ENTRIES to find its
- * bucket.  Same pattern as qos_backend_slot in hooks.c: remember the index,
- * re-validate it cheaply, and rebuild it when the session's identity or the
- * shared settings epoch changes.
+ * Backend-local memo of our token bucket indexes, so a check does not rescan
+ * the slot array.  Managed by qos_find_or_create_slot().
  */
-static int  cached_rate_slot[QOS_RATE_NKINDS] = {-1, -1, -1, -1, -1};
-static Oid  cached_slot_db = InvalidOid;
-static Oid  cached_slot_role = InvalidOid;
-
-/* Warn once per backend when the slot table is exhausted */
-static bool rate_table_full_warned = false;
+static QoSSlotCache rate_slot_cache = QOS_SLOT_CACHE_INIT;
 
 static int64 qos_rate_now_us(void);
-static int qos_rate_find_slot(Oid database_oid, Oid role_oid, int kind,
-                              int initial_tokens);
-static void qos_rate_reset_slot_cache(void);
+static void qos_rate_init_entry(void *entry, void *arg);
 
 /*
  * Human-readable name for a rate kind, used in error messages.
@@ -66,21 +55,6 @@ qos_rate_kind_name(int kind)
 }
 
 /*
- * Drop the cached slot indexes, forcing the next check to re-resolve them.
- */
-static void
-qos_rate_reset_slot_cache(void)
-{
-    int i;
-
-    for (i = 0; i < QOS_RATE_NKINDS; i++)
-        cached_rate_slot[i] = -1;
-
-    cached_slot_db = InvalidOid;
-    cached_slot_role = InvalidOid;
-}
-
-/*
  * Monotonic clock in microseconds.
  *
  * Deliberately not GetCurrentTimestamp(): that is wall-clock time, and an NTP
@@ -97,139 +71,22 @@ qos_rate_now_us(void)
 }
 
 /*
- * Locate the slot for (database_oid, role_oid, kind), allocating one if this
- * is the first check for that triple.  Returns -1 if the table is full.
+ * Initialise a freshly claimed bucket.
  *
- * A newly created bucket starts FULL (initial_tokens), the standard token
- * bucket convention: an idle system has its whole burst allowance available.
- * Starting empty would reject the very first statement after a limit is
- * configured and make every fresh bucket behave as an outage.
- *
- * Caller must NOT hold a rate lock; this function takes them itself.
+ * A new bucket starts FULL, the standard token bucket convention: an idle
+ * system has its whole burst allowance available.  Starting empty would
+ * reject the very first statement after a limit is configured and make every
+ * fresh bucket behave as an outage.
  */
-static int
-qos_rate_find_slot(Oid database_oid, Oid role_oid, int kind, int initial_tokens)
+static void
+qos_rate_init_entry(void *entry, void *arg)
 {
-    int i;
+    QoSRateEntry *e = (QoSRateEntry *) entry;
+    int initial_tokens = *(int *) arg;
 
-    /* Fast path: cached index still points at our bucket.  Slots are never
-     * released once claimed, so a cached index stays valid for the life of
-     * the backend as long as the session identity is unchanged. */
-    if (cached_slot_db == database_oid && cached_slot_role == role_oid &&
-        cached_rate_slot[kind] >= 0)
-        return cached_rate_slot[kind];
-
-    /* Session identity changed - the whole cache is stale */
-    if (cached_slot_db != database_oid || cached_slot_role != role_oid)
-    {
-        qos_rate_reset_slot_cache();
-        cached_slot_db = database_oid;
-        cached_slot_role = role_oid;
-    }
-
-    for (;;)
-    {
-        int free_slot = -1;
-        LWLock *lock;
-        QoSRateEntry *e;
-        bool claimed = false;
-
-        /*
-         * Scan for an existing entry without taking a lock.  The key fields
-         * are written exactly once, under a lock, and database_oid is stored
-         * last behind a write barrier - so a valid database_oid implies the
-         * rest of the key is already visible.  The matching read barrier
-         * below is what makes that hold on weakly ordered architectures
-         * (aarch64, ppc64); without it a reader could see the published
-         * database_oid alongside a stale role_oid or kind and either miss the
-         * entry or match the wrong one.
-         *
-         * A missed match is still possible if the entry is published mid-scan;
-         * that case is caught by the re-check under the lock below.
-         */
-        for (i = 0; i < QOS_MAX_RATE_ENTRIES; i++)
-        {
-            Oid slot_db;
-
-            e = &qos_shared_state->rate_slots[i].entry;
-            slot_db = e->database_oid;
-
-            if (slot_db == InvalidOid)
-            {
-                if (free_slot < 0)
-                    free_slot = i;
-                continue;
-            }
-
-            if (slot_db != database_oid)
-                continue;
-
-            pg_read_barrier();
-
-            if (e->role_oid == role_oid && e->kind == kind)
-            {
-                cached_rate_slot[kind] = i;
-                return i;
-            }
-        }
-
-        if (free_slot < 0)
-        {
-            if (!rate_table_full_warned)
-            {
-                ereport(WARNING,
-                        (errmsg("qos: rate limiter slot table is full (%d entries)",
-                                QOS_MAX_RATE_ENTRIES),
-                         errdetail("Rate limits are not enforced for db=%u role=%u.",
-                                   database_oid, role_oid)));
-                rate_table_full_warned = true;
-            }
-            return -1;
-        }
-
-        /* Claim the free slot, re-checking under the lock */
-        lock = &qos_shared_state->rate_locks[free_slot % QOS_RATE_LOCK_STRIPES].lock;
-        e = &qos_shared_state->rate_slots[free_slot].entry;
-
-        LWLockAcquire(lock, LW_EXCLUSIVE);
-
-        if (e->database_oid == InvalidOid)
-        {
-            e->tokens = (double) initial_tokens;
-            e->last_refill_us = qos_rate_now_us();
-            e->rejected = 0;
-            e->kind = kind;
-            e->role_oid = role_oid;
-
-            /*
-             * Publish last, behind a write barrier: lock-free readers key off
-             * database_oid, so every other field must be visible before it is.
-             */
-            pg_write_barrier();
-            e->database_oid = database_oid;
-            claimed = true;
-        }
-        else if (e->database_oid == database_oid && e->role_oid == role_oid &&
-                 e->kind == kind)
-        {
-            claimed = true;     /* another backend built the same entry */
-        }
-
-        LWLockRelease(lock);
-
-        if (claimed)
-        {
-            cached_rate_slot[kind] = free_slot;
-            return free_slot;
-        }
-
-        /*
-         * Lost the race to a different key.  Rescan from the start rather
-         * than resuming past this slot: a concurrent backend may have
-         * published our key in a slot we already walked, and creating a
-         * duplicate entry would permanently split the bucket.
-         */
-    }
+    e->tokens = (double) initial_tokens;
+    e->last_refill_us = qos_rate_now_us();
+    e->rejected = 0;
 }
 
 /*
@@ -262,7 +119,14 @@ qos_rate_check(int kind, int count, int window_ms, int *retry_after_ms)
     if (kind < 0 || kind >= QOS_RATE_NKINDS)
         return true;
 
-    slot = qos_rate_find_slot(MyDatabaseId, GetUserId(), kind, count);
+    slot = qos_find_or_create_slot(qos_shared_state->rate_slots,
+                                   sizeof(QoSRateSlot),
+                                   QOS_MAX_RATE_ENTRIES,
+                                   MyDatabaseId, GetUserId(), kind,
+                                   qos_shared_state->rate_locks,
+                                   QOS_RATE_LOCK_STRIPES,
+                                   qos_rate_init_entry, &count,
+                                   &rate_slot_cache, "rate limiter");
     if (slot < 0)
         return true;    /* fail open */
 
