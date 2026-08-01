@@ -108,7 +108,6 @@ bool qos_apply_qos_param_value(QoSLimits *limits, const char *name,
 
 PG_FUNCTION_INFO_V1(qos_version);
 PG_FUNCTION_INFO_V1(qos_get_stats);
-PG_FUNCTION_INFO_V1(qos_reset_stats);
 
 Datum
 qos_version(PG_FUNCTION_ARGS)
@@ -116,23 +115,18 @@ qos_version(PG_FUNCTION_ARGS)
     PG_RETURN_TEXT_P(cstring_to_text("PostgreSQL QoS Resource Governor 1.1"));
 }
 
+/*
+ * Deprecated as of 1.1; the qos_stat* views replace it.
+ *
+ * The SQL function is dropped by qos--1.0--1.1.sql, but this symbol MUST stay
+ * in the module: the released qos--1.0.sql binds to it, and removing it makes
+ * that script fail to load against this binary - breaking CREATE EXTENSION
+ * for a pinned 1.0, and any restore path that installs one.
+ */
 Datum
 qos_get_stats(PG_FUNCTION_ARGS)
 {
-    /* TODO: Return current QoS statistics */
-    PG_RETURN_TEXT_P(cstring_to_text("not implemented yet"));
-}
-
-Datum
-qos_reset_stats(PG_FUNCTION_ARGS)
-{
-    if (qos_shared_state)
-    {
-        LWLockAcquire(qos_shared_state->lock, LW_EXCLUSIVE);
-        memset(&qos_shared_state->stats, 0, sizeof(QoSStats));
-        LWLockRelease(qos_shared_state->lock);
-    }
-    PG_RETURN_VOID();
+    PG_RETURN_TEXT_P(cstring_to_text("deprecated: query the qos_stat view instead"));
 }
 
 /*
@@ -159,6 +153,9 @@ qos_shmem_request(void)
      * scan performed for the concurrency limits.
      */
     RequestNamedLWLockTranche("qos_rate", QOS_RATE_LOCK_STRIPES);
+
+    /* Serialises statistics slot creation only; counters use atomics */
+    RequestNamedLWLockTranche("qos_stat", QOS_STAT_LOCK_STRIPES);
 }
 
 /*
@@ -191,6 +188,7 @@ qos_shmem_startup(void)
         memset(qos_shared_state, 0, size);
         qos_shared_state->lock = &(GetNamedLWLockTranche("qos")->lock);
         qos_shared_state->rate_locks = GetNamedLWLockTranche("qos_rate");
+        qos_shared_state->stat_locks = GetNamedLWLockTranche("qos_stat");
         qos_shared_state->settings_epoch = 0;
         qos_shared_state->next_cpu_core = 0;
         qos_shared_state->max_backends = MaxBackends;
@@ -209,6 +207,29 @@ qos_shmem_startup(void)
             qos_shared_state->rate_slots[i].entry.database_oid = InvalidOid;
             qos_shared_state->rate_slots[i].entry.role_oid = InvalidOid;
             qos_shared_state->rate_slots[i].entry.kind = -1;
+        }
+
+        /*
+         * Initialize statistics slots.  Every atomic is initialised here,
+         * once, rather than when a slot is claimed: pg_atomic_init_u64 is not
+         * safe against concurrent access, and doing it at claim time would
+         * race with readers scanning the array.
+         */
+        for (i = 0; i < QOS_MAX_STAT_ENTRIES; i++)
+        {
+            QoSRoleDbStats *e = &qos_shared_state->stat_slots[i].entry;
+            int k;
+
+            e->database_oid = InvalidOid;
+            e->role_oid = InvalidOid;
+            pg_atomic_init_u64(&e->total_statements, 0);
+            pg_atomic_init_u64(&e->rejected_total, 0);
+            pg_atomic_init_u64(&e->work_mem_violations, 0);
+            for (k = 0; k < QOS_RATE_NKINDS; k++)
+            {
+                pg_atomic_init_u64(&e->concurrent_violations[k], 0);
+                pg_atomic_init_u64(&e->rate_violations[k], 0);
+            }
         }
 
         /* Initialize backend status array */

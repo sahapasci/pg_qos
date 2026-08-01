@@ -20,6 +20,7 @@
 
 #include "postgres.h"
 #include "fmgr.h"
+#include "port/atomics.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "nodes/nodes.h"
@@ -74,21 +75,41 @@ typedef enum QoSWorkMemErrorLevel
     QOS_WORK_MEM_ERROR_ERROR = 1
 } QoSWorkMemErrorLevel;
 
-/* QoS Statistics */
-typedef struct QoSStats
+/*
+ * Cumulative counters for one (database, role) pair.
+ *
+ * These are the only statistics kept: cluster-wide numbers are produced by
+ * summing the array, so there is a single source of truth.  Counters are
+ * plain atomics rather than fields under the global LWLock - a counter bump
+ * needs no consistency with its neighbours, and taking an exclusive lock on
+ * the hot path just to add one was pure contention.
+ *
+ * Both violation arrays are indexed by QoSRateKind: that enum is already the
+ * {tx, select, update, delete, insert} set, which is exactly the set of
+ * operations both the concurrency and the rate limits apply to.  Use
+ * qos_rate_kind_name() to label them.
+ *
+ * State is shared-memory only: counters reset when the postmaster restarts.
+ */
+typedef struct QoSRoleDbStats
 {
-    uint64  total_queries;
-    uint64  throttled_queries;
-    uint64  rejected_queries;
-    uint64  work_mem_violations;
-    uint64  cpu_violations;
-    uint64  concurrent_tx_violations;
-    uint64  concurrent_select_violations;
-    uint64  concurrent_update_violations;
-    uint64  concurrent_delete_violations;
-    uint64  concurrent_insert_violations;
-    uint64  rate_violations[QOS_RATE_NKINDS];
-} QoSStats;
+    Oid     database_oid;       /* InvalidOid = free slot */
+    Oid     role_oid;
+    pg_atomic_uint64 total_statements;
+    pg_atomic_uint64 rejected_total;
+    pg_atomic_uint64 concurrent_violations[QOS_RATE_NKINDS];
+    pg_atomic_uint64 rate_violations[QOS_RATE_NKINDS];
+    pg_atomic_uint64 work_mem_violations;
+} QoSRoleDbStats;
+
+typedef union QoSStatSlot
+{
+    QoSRoleDbStats entry;
+    char           pad[PG_CACHE_LINE_SIZE];
+} QoSStatSlot;
+
+#define QOS_MAX_STAT_ENTRIES    512
+#define QOS_STAT_LOCK_STRIPES   8
 
 /*
  * Token-bucket state for one (database, role, kind) triple.
@@ -146,7 +167,6 @@ typedef struct QoSBackendStatus
 typedef struct QoSSharedState
 {
     LWLock     *lock;
-    QoSStats    stats;
     int         settings_epoch;     /* Bumped on ALTER ROLE/DB SET qos.* to notify sessions */
     int         next_cpu_core;      /* Round-robin counter for CPU core assignment (protected by lock) */
     int         max_backends;       /* MaxBackends value at startup */
@@ -159,6 +179,14 @@ typedef struct QoSSharedState
      */
     LWLockPadded *rate_locks;
     QoSRateSlot   rate_slots[QOS_MAX_RATE_ENTRIES];
+
+    /*
+     * Cumulative per-(database, role) counters.  Slot creation is serialised
+     * by stat_locks; the counters themselves are updated with atomics and
+     * read without any lock.
+     */
+    LWLockPadded *stat_locks;
+    QoSStatSlot   stat_slots[QOS_MAX_STAT_ENTRIES];
 
     /*
      * Per-backend status array for robust concurrency tracking.
@@ -181,8 +209,14 @@ extern void _PG_fini(void);
 
 /* helper C functions callable from SQL */
 extern Datum qos_version(PG_FUNCTION_ARGS);
-extern Datum qos_get_stats(PG_FUNCTION_ARGS);
+extern Datum qos_get_stats(PG_FUNCTION_ARGS);   /* deprecated; kept for old scripts */
 extern Datum qos_reset_stats(PG_FUNCTION_ARGS);
+extern Datum qos_reset_stats_for(PG_FUNCTION_ARGS);
+extern Datum qos_stat(PG_FUNCTION_ARGS);
+extern Datum qos_stat_activity(PG_FUNCTION_ARGS);
+extern Datum qos_stat_rate(PG_FUNCTION_ARGS);
+extern Datum qos_stat_cpu(PG_FUNCTION_ARGS);
+extern Datum qos_prometheus_metrics(PG_FUNCTION_ARGS);
 
 /* Function declarations */
 extern QoSLimits qos_get_role_limits(Oid roleId);
@@ -193,11 +227,55 @@ extern bool qos_is_valid_qos_param_name(const char *name);
 extern bool qos_apply_qos_param_value(QoSLimits *limits, const char *name,
                                       const char *value, bool strict);
 extern void qos_limits_init_unset(QoSLimits *limits);
+extern void qos_compute_effective_limits(Oid roleId, Oid dbId, QoSLimits *out);
 
 /* rate limiting (hooks_rate.c) */
 extern const char *qos_rate_kind_name(int kind);
 extern bool qos_rate_check(int kind, int count, int window_ms,
                            int *retry_after_ms);
+
+/*
+ * Shared-memory slot lookup (qos_shmem_slot.c)
+ *
+ * Find or create the slot keyed by (db, role, kind) in a fixed-size array of
+ * `nslots` entries laid out `stride` bytes apart, whose first three fields
+ * are {Oid database_oid; Oid role_oid; int kind;}.  Pass kind < 0 for arrays
+ * keyed by (db, role) alone.  Returns the index, or -1 when the array is
+ * full (callers are expected to degrade gracefully rather than fail).
+ *
+ * `cache` is the caller's backend-local memo of the last resolved indexes,
+ * which makes repeat lookups O(1).  It holds one index per kind and the
+ * identity they were resolved for; when the session's database or role
+ * changes, EVERY memoised index is dropped, not just the one being looked up.
+ */
+typedef void (*QoSSlotInitCallback) (void *entry, void *arg);
+
+typedef struct QoSSlotCache
+{
+    Oid  db;
+    Oid  role;
+    int  slot[QOS_RATE_NKINDS];     /* by kind; index 0 when kind < 0 */
+} QoSSlotCache;
+
+#define QOS_SLOT_CACHE_INIT { InvalidOid, InvalidOid, {-1, -1, -1, -1, -1} }
+
+extern int qos_find_or_create_slot(void *base, Size stride, int nslots,
+                                   Oid database_oid, Oid role_oid, int kind,
+                                   LWLockPadded *locks, int nstripes,
+                                   QoSSlotInitCallback init_cb, void *init_arg,
+                                   QoSSlotCache *cache, const char *what);
+
+/* statistics (qos_stats.c) */
+typedef enum QoSRejectCategory
+{
+    QOS_REJECT_CONCURRENT,      /* kind = QoSRateKind */
+    QOS_REJECT_RATE,            /* kind = QoSRateKind */
+    QOS_REJECT_WORK_MEM         /* kind ignored */
+} QoSRejectCategory;
+
+extern QoSRoleDbStats *qos_stat_entry(void);
+extern void qos_stat_count_statement(void);
+extern void qos_stat_count_rejection(QoSRejectCategory category, int kind);
 /* cache/epoch notifications */
 extern void qos_notify_settings_change(void);
 

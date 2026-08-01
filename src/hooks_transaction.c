@@ -54,12 +54,17 @@ qos_track_transaction_start(void)
     if (!qos_shared_state)
         return;
 
-    /* Nothing configured - skip the shared memory work entirely */
-    if (limits.max_concurrent_tx <= 0 && rate_count <= 0)
-        return;
-
+    /*
+     * Registration happens even with no transaction limit configured.  The
+     * scan below is what costs; marking our own slot is a couple of stores,
+     * and skipping it would leave qos_stat_activity reporting in_transaction
+     * as false for every session on an unlimited role - silently wrong rather
+     * than merely absent.
+     */
     if (limits.max_concurrent_tx > 0)
     {
+        qos_ensure_exit_callback();
+
 #ifndef MyBackendId
     my_slot = qos_get_backend_slot(true);
 #endif
@@ -93,10 +98,10 @@ qos_track_transaction_start(void)
         
         if (count >= limits.max_concurrent_tx)
         {
-            qos_shared_state->stats.concurrent_tx_violations++;
-            qos_shared_state->stats.rejected_queries++;
             LWLockRelease(qos_shared_state->lock);
-            
+
+            qos_stat_count_rejection(QOS_REJECT_CONCURRENT, QOS_RATE_TX);
+
             ereport(ERROR,
                     (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
                      errmsg("qos: maximum concurrent transactions exceeded"),
@@ -127,9 +132,8 @@ qos_track_transaction_start(void)
     else
     {
         /*
-         * Rate limit configured without a concurrency limit: still claim a
-         * slot and mark ourselves in-transaction, so that a concurrency limit
-         * added later (and qos_track_transaction_end) sees consistent state.
+         * No concurrency limit: skip the scan but still record that we are in
+         * a transaction, so the activity view stays accurate.
          */
 #ifndef MyBackendId
         my_slot = qos_get_backend_slot(true);
@@ -164,10 +168,7 @@ qos_track_transaction_start(void)
     {
         qos_track_transaction_end();
 
-        LWLockAcquire(qos_shared_state->lock, LW_EXCLUSIVE);
-        qos_shared_state->stats.rate_violations[QOS_RATE_TX]++;
-        qos_shared_state->stats.rejected_queries++;
-        LWLockRelease(qos_shared_state->lock);
+        qos_stat_count_rejection(QOS_REJECT_RATE, QOS_RATE_TX);
 
         ereport(ERROR,
                 (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),

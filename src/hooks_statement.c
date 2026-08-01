@@ -79,52 +79,54 @@ qos_track_statement_start(CmdType operation)
 
     if (qos_shared_state)
     {
+        qos_ensure_exit_callback();
+
 #ifndef MyBackendId
     my_slot = qos_get_backend_slot(true);
 #endif
         LWLockAcquire(qos_shared_state->lock, LW_EXCLUSIVE);
-        
-        /* Scan active backends to count current usage */
-        for (i = 0; i < qos_shared_state->max_backends; i++)
+
+        /*
+         * Scan active backends to count current usage.
+         *
+         * Only worth doing when a concurrency limit is actually configured:
+         * with limit_val <= 0 the result is never read, and this loop walks
+         * max_backends entries under an exclusive lock on every statement.
+         */
+        if (limit_val > 0)
         {
-            /* Skip empty slots */
-            if (qos_shared_state->backend_status[i].pid == 0)
-                continue;
-                
-            /* Skip myself */
-#ifndef MyBackendId
-            if (i == my_slot)
-                continue;
-#else
-            if (i == MyBackendId - 1)
-                continue;
-#endif
-            
-            /* Count if matches my role, db, and operation */
-            if (qos_shared_state->backend_status[i].role_oid == GetUserId() &&
-                qos_shared_state->backend_status[i].database_oid == MyDatabaseId &&
-                qos_shared_state->backend_status[i].cmd_type == operation)
+            for (i = 0; i < qos_shared_state->max_backends; i++)
             {
-                count++;
+                /* Skip empty slots */
+                if (qos_shared_state->backend_status[i].pid == 0)
+                    continue;
+
+                /* Skip myself */
+#ifndef MyBackendId
+                if (i == my_slot)
+                    continue;
+#else
+                if (i == MyBackendId - 1)
+                    continue;
+#endif
+
+                /* Count if matches my role, db, and operation */
+                if (qos_shared_state->backend_status[i].role_oid == GetUserId() &&
+                    qos_shared_state->backend_status[i].database_oid == MyDatabaseId &&
+                    qos_shared_state->backend_status[i].cmd_type == operation)
+                {
+                    count++;
+                }
             }
         }
-        
+
         /* Check limit */
         if (limit_val > 0 && count >= limit_val)
         {
-            /* Update stats */
-            switch (operation)
-            {
-                case CMD_SELECT: qos_shared_state->stats.concurrent_select_violations++; break;
-                case CMD_UPDATE: qos_shared_state->stats.concurrent_update_violations++; break;
-                case CMD_DELETE: qos_shared_state->stats.concurrent_delete_violations++; break;
-                case CMD_INSERT: qos_shared_state->stats.concurrent_insert_violations++; break;
-                default: break;
-            }
-            qos_shared_state->stats.rejected_queries++;
-            
             LWLockRelease(qos_shared_state->lock);
-            
+
+            qos_stat_count_rejection(QOS_REJECT_CONCURRENT, rate_kind);
+
             ereport(ERROR,
                     (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
                      errmsg("qos: maximum concurrent %s statements exceeded", 
@@ -157,6 +159,8 @@ qos_track_statement_start(CmdType operation)
         current_statement_type = operation;
         statement_tracked = true;
 
+        qos_stat_count_statement();
+
         /*
          * Rate check runs after the concurrency check so that a statement
          * already rejected for concurrency does not burn a token.  On
@@ -168,10 +172,7 @@ qos_track_statement_start(CmdType operation)
         {
             qos_track_statement_end();
 
-            LWLockAcquire(qos_shared_state->lock, LW_EXCLUSIVE);
-            qos_shared_state->stats.rate_violations[rate_kind]++;
-            qos_shared_state->stats.rejected_queries++;
-            LWLockRelease(qos_shared_state->lock);
+            qos_stat_count_rejection(QOS_REJECT_RATE, rate_kind);
 
             ereport(ERROR,
                     (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
