@@ -561,12 +561,7 @@ qos_enforce_work_mem_limit(VariableSetStmt *stmt)
                     work_mem = new_work_mem_kb;
                 }
 
-                if (qos_shared_state)
-                {
-                    LWLockAcquire(qos_shared_state->lock, LW_EXCLUSIVE);
-                    qos_shared_state->stats.work_mem_violations++;
-                    LWLockRelease(qos_shared_state->lock);
-                }
+                qos_stat_count_rejection(QOS_REJECT_WORK_MEM, -1);
                 
                 ereport(elevel,
                         (errcode(ERRCODE_INSUFFICIENT_RESOURCES),
@@ -619,12 +614,7 @@ qos_enforce_work_mem_limit(VariableSetStmt *stmt)
             elog(LOG, "qos: work_mem enforced at %d KB (was %d KB) for db=%u role=%u",
                  new_work_mem_kb, current_work_mem_kb, MyDatabaseId, GetUserId());
             
-            if (qos_shared_state)
-            {
-                LWLockAcquire(qos_shared_state->lock, LW_EXCLUSIVE);
-                qos_shared_state->stats.work_mem_violations++;
-                LWLockRelease(qos_shared_state->lock);
-            }
+            qos_stat_count_rejection(QOS_REJECT_WORK_MEM, -1);
         }
     }
 }
