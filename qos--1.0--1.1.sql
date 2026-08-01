@@ -2,9 +2,9 @@
 -- Upgrade from QoS extension 1.0 to 1.1
 --
 -- 1.1 adds:
---   * time-windowed (rate) limits: qos.max_*_rate / qos.max_*_rate_window,
---     enforced in the C module and configured through pg_db_role_setting,
---     so they need no SQL objects of their own
+--   * time-windowed (rate) limits: qos.max_*_rate, configured as
+--     '<count>/<window>' (e.g. '100/1s') and enforced in the C module through
+--     pg_db_role_setting, so they need no SQL objects of their own
 --   * observability: per-(database, role) counters, live activity views and
 --     a Prometheus renderer
 --

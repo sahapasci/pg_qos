@@ -1,9 +1,9 @@
 /*
  * hooks_rate.c - Time-windowed (rate) limit enforcement
  *
- * Implements the qos.max_*_rate / qos.max_*_rate_window limits: "at most N
- * operations per W milliseconds" for transactions and for each statement
- * type, counted per (database, role) across all backends.
+ * Implements the qos.max_*_rate limits ("<count>/<window>", e.g. "100/1s"):
+ * "at most N operations per W milliseconds" for transactions and for each
+ * statement type, counted per (database, role) across all backends.
  *
  * The algorithm is a token bucket with lazy refill.  Nothing runs
  * periodically - each check adds elapsed * (count / window) tokens before

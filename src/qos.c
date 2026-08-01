@@ -66,32 +66,29 @@ const char *qos_valid_param_hint =
     "qos.max_concurrent_tx, qos.max_concurrent_select, "
     "qos.max_concurrent_update, qos.max_concurrent_delete, "
     "qos.max_concurrent_insert, qos.work_mem_error_level, "
-    "qos.max_tx_rate, qos.max_tx_rate_window, "
-    "qos.max_select_rate, qos.max_select_rate_window, "
-    "qos.max_update_rate, qos.max_update_rate_window, "
-    "qos.max_delete_rate, qos.max_delete_rate_window, "
-    "qos.max_insert_rate, qos.max_insert_rate_window";
+    "qos.max_tx_rate, qos.max_select_rate, qos.max_update_rate, "
+    "qos.max_delete_rate, qos.max_insert_rate";
 
 /*
  * Parameter names for the time-windowed (rate) limits, indexed by QoSRateKind.
- * Each limit is configured as a separate count/window parameter pair.
+ * Each limit is configured as a single "<count>/<window>" value, e.g. "100/1s".
  */
-static const struct
-{
-    const char *count_name;
-    const char *window_name;
-} qos_rate_params[QOS_RATE_NKINDS] = {
-    {"qos.max_tx_rate",     "qos.max_tx_rate_window"},
-    {"qos.max_select_rate", "qos.max_select_rate_window"},
-    {"qos.max_update_rate", "qos.max_update_rate_window"},
-    {"qos.max_delete_rate", "qos.max_delete_rate_window"},
-    {"qos.max_insert_rate", "qos.max_insert_rate_window"}
+static const char *qos_rate_params[QOS_RATE_NKINDS] = {
+    "qos.max_tx_rate",
+    "qos.max_select_rate",
+    "qos.max_update_rate",
+    "qos.max_delete_rate",
+    "qos.max_insert_rate"
 };
 
 static char *qos_trim_whitespace(char *str);
-static bool qos_lookup_rate_param(const char *name, int *kind, bool *is_window);
+static bool qos_lookup_rate_param(const char *name, int *kind);
 static bool qos_parse_duration_value(const char *value_str, int *out_ms,
-                                     const char *param_name, bool strict);
+                                     const char *param_name,
+                                     const char *display_value, bool strict);
+static bool qos_parse_rate_value(const char *value_str, int *out_count,
+                                 int *out_window_ms,
+                                 const char *param_name, bool strict);
 static bool qos_parse_int32_value(const char *value_str, int *out,
                                   int min_value, int max_value,
                                   bool allow_negative_one,
@@ -334,11 +331,11 @@ qos_limits_init_unset(QoSLimits *limits)
 }
 
 /*
- * Map a qos.max_*_rate[_window] parameter name to its kind.
+ * Map a qos.max_*_rate parameter name to its kind.
  * Returns false if the name is not a rate parameter.
  */
 static bool
-qos_lookup_rate_param(const char *name, int *kind, bool *is_window)
+qos_lookup_rate_param(const char *name, int *kind)
 {
     int i;
 
@@ -347,16 +344,9 @@ qos_lookup_rate_param(const char *name, int *kind, bool *is_window)
 
     for (i = 0; i < QOS_RATE_NKINDS; i++)
     {
-        if (strcmp(name, qos_rate_params[i].count_name) == 0)
+        if (strcmp(name, qos_rate_params[i]) == 0)
         {
             *kind = i;
-            *is_window = false;
-            return true;
-        }
-        if (strcmp(name, qos_rate_params[i].window_name) == 0)
-        {
-            *kind = i;
-            *is_window = true;
             return true;
         }
     }
@@ -365,16 +355,21 @@ qos_lookup_rate_param(const char *name, int *kind, bool *is_window)
 }
 
 /*
- * Parse a rate window: an integer with an optional ms/s/min suffix.
- * A bare number is interpreted as milliseconds.  -1 means "unset".
+ * Parse the window half of a rate value: an integer with an optional
+ * ms/s/min suffix.  A bare number is interpreted as milliseconds.
  *
  * The lower bound exists to stop nonsensical configurations, not for
  * performance reasons: token-bucket refill is lazy, so a 100ms window costs
  * exactly as much CPU per check as a 1 hour window.
+ *
+ * display_value is the full "<count>/<window>" the user wrote; error messages
+ * quote that rather than the isolated window half, which on its own would look
+ * like something the user never typed.
  */
 static bool
 qos_parse_duration_value(const char *value_str, int *out_ms,
-                         const char *param_name, bool strict)
+                         const char *param_name, const char *display_value,
+                         bool strict)
 {
     char *endptr;
     long base;
@@ -406,14 +401,6 @@ qos_parse_duration_value(const char *value_str, int *out_ms,
             goto invalid;
     }
 
-    /* -1 disables the setting; it must not carry a unit */
-    if (base == -1 && *suffix == '\0')
-    {
-        if (out_ms)
-            *out_ms = -1;
-        return true;
-    }
-
     if (base < 0)
         goto invalid;
 
@@ -423,12 +410,12 @@ qos_parse_duration_value(const char *value_str, int *out_ms,
     {
         if (strict)
             ereport(ERROR,
-                    (errmsg("qos: invalid value for %s: \"%s\"", param_name, value_str),
+                    (errmsg("qos: invalid value for %s: \"%s\"", param_name, display_value),
                      errdetail("Window must be between %d ms and %d ms.",
                                QOS_RATE_WINDOW_MIN_MS, QOS_RATE_WINDOW_MAX_MS)));
         else
             elog(DEBUG1, "qos: out-of-range value for %s: \"%s\" (ignored)",
-                 param_name, value_str);
+                 param_name, display_value);
         return false;
     }
 
@@ -439,10 +426,93 @@ qos_parse_duration_value(const char *value_str, int *out_ms,
 invalid:
     if (strict)
         ereport(ERROR,
-                (errmsg("qos: invalid value for %s: \"%s\"", param_name, value_str),
-                 errdetail("Expected a duration with optional unit (ms, s, min) or -1.")));
+                (errmsg("qos: invalid value for %s: \"%s\"", param_name, display_value),
+                 errdetail("Expected a duration with optional unit (ms, s, min) "
+                           "after the slash.")));
     else
-        elog(DEBUG1, "qos: invalid value for %s: \"%s\" (ignored)", param_name, value_str);
+        elog(DEBUG1, "qos: invalid value for %s: \"%s\" (ignored)", param_name,
+             display_value);
+    return false;
+}
+
+/*
+ * Parse a rate limit: "<count>/<window>", e.g. "100/1s" or "10/500ms".
+ * "-1" disables the limit.
+ *
+ * The slash is mandatory: a bare count would leave the window implicit, and an
+ * implicit window is exactly what made the old two-parameter form easy to
+ * misconfigure.
+ */
+static bool
+qos_parse_rate_value(const char *value_str, int *out_count, int *out_window_ms,
+                     const char *param_name, bool strict)
+{
+    char *copy;
+    char *count_part;
+    char *window_part;
+    char *slash;
+    int count = -1;
+    int window_ms = -1;
+
+    if (value_str == NULL || *value_str == '\0')
+        goto invalid;
+
+    copy = pstrdup(value_str);
+    count_part = qos_trim_whitespace(copy);
+
+    /* The one value that carries no window */
+    if (strcmp(count_part, "-1") == 0)
+    {
+        pfree(copy);
+        if (out_count)
+            *out_count = -1;
+        if (out_window_ms)
+            *out_window_ms = -1;
+        return true;
+    }
+
+    slash = strchr(count_part, '/');
+    if (slash == NULL)
+    {
+        pfree(copy);
+        goto invalid;
+    }
+
+    *slash = '\0';
+    window_part = qos_trim_whitespace(slash + 1);
+    count_part = qos_trim_whitespace(count_part);
+
+    if (!qos_parse_int32_value(count_part, &count, 1, INT_MAX, false,
+                               param_name, false))
+    {
+        pfree(copy);
+        goto invalid;
+    }
+
+    if (!qos_parse_duration_value(window_part, &window_ms, param_name,
+                                  value_str, strict))
+    {
+        pfree(copy);
+        return false;
+    }
+
+    pfree(copy);
+
+    if (out_count)
+        *out_count = count;
+    if (out_window_ms)
+        *out_window_ms = window_ms;
+    return true;
+
+invalid:
+    if (strict)
+        ereport(ERROR,
+                (errmsg("qos: invalid value for %s: \"%s\"", param_name, value_str),
+                 errdetail("Expected \"<count>/<window>\", for example \"100/1s\", "
+                           "or -1 to disable.")));
+    else
+        elog(DEBUG1, "qos: invalid value for %s: \"%s\" (ignored)", param_name,
+             value_str);
     return false;
 }
 
@@ -593,12 +663,11 @@ static bool
 qos_is_valid_qos_param_name_internal(const char *name)
 {
     int kind;
-    bool is_window;
 
     if (name == NULL)
         return false;
 
-    if (qos_lookup_rate_param(name, &kind, &is_window))
+    if (qos_lookup_rate_param(name, &kind))
         return true;
 
     if (strcmp(name, "qos.work_mem_limit") == 0)
@@ -638,7 +707,6 @@ qos_apply_qos_param_value(QoSLimits *limits, const char *name,
     char *value_copy = NULL;
     char *trimmed_value = NULL;
     int rate_kind = 0;
-    bool rate_is_window = false;
 
     if (name == NULL)
         return false;
@@ -673,29 +741,21 @@ qos_apply_qos_param_value(QoSLimits *limits, const char *name,
     value_copy = pstrdup(value);
     trimmed_value = qos_trim_whitespace(value_copy);
 
-    /* Time-windowed (rate) limits: count and window are separate parameters */
-    if (qos_lookup_rate_param(name, &rate_kind, &rate_is_window))
+    /* Time-windowed (rate) limits: a single "<count>/<window>" value */
+    if (qos_lookup_rate_param(name, &rate_kind))
     {
-        if (rate_is_window)
+        int parsed_window = -1;
+
+        if (!qos_parse_rate_value(trimmed_value, &parsed_int, &parsed_window,
+                                  name, strict))
         {
-            if (!qos_parse_duration_value(trimmed_value, &parsed_int, name, strict))
-            {
-                pfree(value_copy);
-                return false;
-            }
-            if (limits)
-                limits->max_rate_window_ms[rate_kind] = parsed_int;
+            pfree(value_copy);
+            return false;
         }
-        else
+        if (limits)
         {
-            if (!qos_parse_int32_value(trimmed_value, &parsed_int, 0, INT_MAX, true,
-                                       name, strict))
-            {
-                pfree(value_copy);
-                return false;
-            }
-            if (limits)
-                limits->max_rate[rate_kind] = parsed_int;
+            limits->max_rate[rate_kind] = parsed_int;
+            limits->max_rate_window_ms[rate_kind] = parsed_window;
         }
         pfree(value_copy);
         return true;

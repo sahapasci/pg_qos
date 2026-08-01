@@ -39,7 +39,7 @@ typedef enum QoSRateKind
     QOS_RATE_NKINDS
 } QoSRateKind;
 
-/* Bounds for qos.max_*_rate_window (milliseconds) */
+/* Bounds for the window half of qos.max_*_rate (milliseconds) */
 #define QOS_RATE_WINDOW_MIN_MS      100
 #define QOS_RATE_WINDOW_MAX_MS      (24 * 60 * 60 * 1000)   /* 1 day */
 #define QOS_RATE_WINDOW_DEFAULT_MS  1000
@@ -60,10 +60,11 @@ typedef struct QoSLimits
 
     /*
      * Time-windowed (rate) limits.  Each entry is a (count, window) pair:
-     * "at most <count> operations per <window> milliseconds".  A count of -1
-     * disables the limit; the window defaults to QOS_RATE_WINDOW_DEFAULT_MS
-     * when only the count is configured.  Indexed by QoSRateKind so the
-     * enforcement code can stay table-driven.
+     * "at most <count> operations per <window> milliseconds", configured as a
+     * single "<count>/<window>" string such as "100/1s".  A count of -1
+     * disables the limit.  Merging two limits can still leave a window unset,
+     * in which case QOS_RATE_WINDOW_DEFAULT_MS applies.  Indexed by
+     * QoSRateKind so the enforcement code can stay table-driven.
      */
     int     max_rate[QOS_RATE_NKINDS];             /* -1 = no limit */
     int     max_rate_window_ms[QOS_RATE_NKINDS];   /* -1 = unset */
