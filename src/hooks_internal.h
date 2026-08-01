@@ -38,6 +38,9 @@ extern void qos_track_statement_end(void);
 extern void qos_track_transaction_start(void);
 extern void qos_track_transaction_end(void);
 
+/* Per-backend exit cleanup registration (hooks.c) */
+extern void qos_ensure_exit_callback(void);
+
 /* For version 17+ */
 #ifndef MyBackendId
 /* Backend slot helper (implemented in hooks.c) */

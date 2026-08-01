@@ -194,6 +194,37 @@ qos_shmem_exit_cleanup(int code, Datum arg)
 }
 
 /*
+ * Register the exit cleanup for THIS backend, once.
+ *
+ * Registering it from _PG_init() is not enough: _PG_init() runs in the
+ * postmaster while shared_preload_libraries is processed, and PostgreSQL
+ * clears the exit callback list in forked children - so the callback that
+ * looked registered never actually ran in any backend.  The result was that
+ * every backend leaked its backend_status slot on disconnect, recovered only
+ * once the array filled and the stale-PID sweep in qos_get_backend_slot()
+ * kicked in.
+ *
+ * Called from the tracking paths, which are exactly the places that claim a
+ * slot in the first place.
+ */
+void
+qos_ensure_exit_callback(void)
+{
+    static bool registered = false;
+
+    if (registered || !qos_shared_state)
+        return;
+
+    /*
+     * before_shmem_exit (rather than on_shmem_exit) so the LWLock
+     * infrastructure is still functional when we run: ProcKill has not
+     * detached us from shared memory yet.
+     */
+    before_shmem_exit(qos_shmem_exit_cleanup, 0);
+    registered = true;
+}
+
+/*
  * Transaction callback to handle cleanup on abort/error
  */
 static void
@@ -625,12 +656,11 @@ qos_register_hooks(void)
     RegisterXactCallback(qos_xact_callback, NULL);
     
     /*
-     * Register shared-memory exit callback to free our backend_status slot
-     * when this backend exits.  Using before_shmem_exit ensures the LWLock
-     * infrastructure is still functional (ProcKill hasn't run yet).
+     * The shared-memory exit callback is NOT registered here: this runs in
+     * the postmaster, and the callback list does not survive into forked
+     * backends.  qos_ensure_exit_callback() registers it per backend.
      */
-    before_shmem_exit(qos_shmem_exit_cleanup, 0);
-    
+
     elog(DEBUG1, "qos: hooks registered and cache initialized");
 }
 
