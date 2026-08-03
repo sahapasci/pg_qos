@@ -14,7 +14,9 @@ endif
 
 EXTENSION = qos
 DATA = qos--1.0.sql qos--1.0--1.1.sql qos--1.1.sql
-
+ifndef PG_CONFIG
+       PG_CONFIG = pg_config
+endif
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 
 include $(PGXS)
