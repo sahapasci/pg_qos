@@ -13,8 +13,10 @@ and to prevent complicating maintenance/administration processes by eliminating 
 - Limit CPU usage by binding the backend to N CPU cores (Linux only); planner integration ensures parallel workers stay within that cap
 - Track and cap concurrent transactions and statements (SELECT/UPDATE/DELETE/INSERT)
 - Limit work_mem per session
+- Cap the *rate* of transactions and statements ("100 per second") per database and role
 - Enforce per-role and per-database limits via `ALTER ROLE/DATABASE SET qos.*`
 - Fast, reliable cache invalidation across sessions (no reconnect) using a shared epoch mechanism
+- Report live activity and per-(database, role) counters through SQL views and a Prometheus endpoint
 
 ## Requirements
 
@@ -148,22 +150,23 @@ time*; they do not cap how *fast* operations arrive. A single backend can run
 
 The rate limits below cap throughput: "at most N operations per W
 milliseconds", counted per `(database, role)` across all backends. Each limit
-is a pair of settings — a count and a window:
+is a single setting written as `'<count>/<window>'`:
 
-| Count | Window | Meaning |
-| --- | --- | --- |
-| `qos.max_tx_rate` | `qos.max_tx_rate_window` | transactions per window |
-| `qos.max_select_rate` | `qos.max_select_rate_window` | SELECTs per window |
-| `qos.max_update_rate` | `qos.max_update_rate_window` | UPDATEs per window |
-| `qos.max_delete_rate` | `qos.max_delete_rate_window` | DELETEs per window |
-| `qos.max_insert_rate` | `qos.max_insert_rate_window` | INSERTs per window |
+| Setting | Meaning |
+| --- | --- |
+| `qos.max_tx_rate` | transactions per window |
+| `qos.max_select_rate` | SELECTs per window |
+| `qos.max_update_rate` | UPDATEs per window |
+| `qos.max_delete_rate` | DELETEs per window |
+| `qos.max_insert_rate` | INSERTs per window |
 
 - `-1` (the default) disables the limit, so behaviour is unchanged until you
   set one.
+- The slash is required: `'100/1s'`, `'10/500ms'`, `'5/1min'`. A bare `'100'`
+  is rejected — only `-1` may omit the window.
 - Windows accept `ms`, `s` and `min` suffixes; a bare number means
   milliseconds. The minimum is **100 ms**, the maximum 1 day.
-- Setting a count without a window uses a default window of `1s`. Setting a
-  window without a count does nothing.
+- The count must be at least 1.
 - Exceeding a limit raises `ERROR` with SQLSTATE `54000`
   (`program_limit_exceeded`), the same as the concurrency limits. The hint
   reports roughly how long to wait before retrying.
@@ -189,10 +192,8 @@ ALTER ROLE app_user IN database appdb SET qos.work_mem_limit = '4MB';
 ALTER ROLE app_user IN database appdb SET qos.max_concurrent_update = '10';
 
 -- Rate limits: at most 100 transactions per second, 10 SELECTs per 500 ms
-ALTER ROLE app_user SET qos.max_tx_rate = '100';
-ALTER ROLE app_user SET qos.max_tx_rate_window = '1s';
-ALTER ROLE app_user SET qos.max_select_rate = '10';
-ALTER ROLE app_user SET qos.max_select_rate_window = '500ms';
+ALTER ROLE app_user SET qos.max_tx_rate = '100/1s';
+ALTER ROLE app_user SET qos.max_select_rate = '10/500ms';
 ```
 
 Effective limits are the most restrictive combination of role-level and database-level settings.
@@ -213,14 +214,123 @@ rates, so `10/1s` (10/sec) wins over `100/500ms` (200/sec).
   - Executor hooks track active transactions and statements per command type; caps are enforced against configured maxima.
 
 - Rate limits
-  - Each `(database, role, operation)` gets a token bucket in shared memory, refilled lazily: a check adds `elapsed * (count / window)` tokens and then consumes one.
-  - Nothing runs periodically, so the CPU cost of a check does not depend on the window length — a 100 ms window costs the same as a one hour window. The check itself is O(1) and measurably cheaper than the concurrency scan that already runs per statement.
-  - A fresh bucket starts full, so an idle system has its whole burst allowance available.
+  - Each `(database, role, operation)` gets a fixed window counter in shared memory: time is cut into `window`-long slices and each slice allows `count` operations. The whole allowance returns at once when a slice ends, so `'3/50s'` means three operations in every 50 second slice — not one every 16.7 seconds.
+  - Rollover is lazy: a check compares the current time against the slice it holds and zeroes the counter if it has expired. Nothing runs periodically, so the CPU cost of a check does not depend on the window length — a 100 ms window costs the same as a one hour window. The check itself is O(1) and measurably cheaper than the concurrency scan that already runs per statement.
+  - Known trade-off — the boundary effect: `count` operations at the end of one slice and `count` more at the start of the next put 2x `count` through in a short span. Avoiding it needs a sliding window, which would cost one timestamp per operation in shared memory.
+  - A fresh counter starts unspent, so an idle system has its whole allowance available.
   - Timing uses a monotonic clock, so an NTP step backwards cannot stall a limit.
   - Fails open: if the shared slot table (512 entries) is exhausted, a warning is logged and traffic is allowed rather than blocked.
 
 
-## Observability and Logging
+## Observability
+
+Four views expose what QoS is doing. All of them, and the functions behind
+them, are readable by `pg_monitor` and not by `PUBLIC` — they report activity
+and identities from every database in the cluster:
+
+```sql
+GRANT pg_monitor TO metrics_user;
+```
+
+The shared state is cluster-wide, so querying from any single database
+returns rows for every database. `CREATE EXTENSION qos` in one database is
+enough for monitoring.
+
+| View | Shows |
+| --- | --- |
+| `qos_stat` | cumulative counters per database and role |
+| `qos_stat_activity` | backends currently running a governed operation |
+| `qos_stat_rate` | live rate limit windows, with the configured limit |
+| `qos_stat_cpu` | CPU cores assigned per database and role (Linux) |
+
+```sql
+-- Who is being rejected, and how often relative to their traffic?
+SELECT datname, rolname, total_statements, rejected_total,
+       round(100.0 * rejected_total / nullif(total_statements, 0), 2) AS reject_pct
+FROM qos_stat
+ORDER BY rejected_total DESC;
+
+-- How close is each rate limit to exhaustion right now?
+SELECT datname, rolname, kind, used, rate_limit, window_reset_ms
+FROM qos_stat_rate
+WHERE rate_limit IS NOT NULL;
+
+-- What is running under QoS at this instant?
+SELECT pid, datname, rolname, cmd_type, in_transaction FROM qos_stat_activity;
+```
+
+`qos_stat` breaks rejections down by cause: `concurrent_*_violations`,
+`rate_*_violations` and `work_mem_violations`, plus `rejected_total`.
+
+Counters live in shared memory only and **reset when the postmaster
+restarts** — there is no on-disk state to keep compatible across upgrades.
+Prometheus handles counter resets natively (`rate()` accounts for them).
+
+Reset manually with `SELECT qos_reset_stats();` for everything, or
+`SELECT qos_reset_stats('appdb', 'app_user');` for one database and role.
+
+`used` and `window_reset_ms` are rolled over before they are reported, so they
+describe the window a statement arriving now would actually meet — an expired
+window reads as already reset, not as the stale value left by the last check.
+
+A database or role dropped since its counters were recorded is reported by its
+OID in the `datname`/`rolname` column, so the row stays identifiable instead of
+turning into a nameless `NULL`.
+
+### Prometheus
+
+`qos_prometheus_metrics()` renders everything in exposition format:
+
+```sql
+SELECT qos_prometheus_metrics();
+```
+
+```text
+# HELP qos_statements_total Statements processed under QoS governance
+# TYPE qos_statements_total counter
+qos_statements_total{datname="appdb",rolname="app_user"} 154823
+# HELP qos_rejected_total Operations rejected by a QoS limit
+# TYPE qos_rejected_total counter
+qos_rejected_total{datname="appdb",rolname="app_user",reason="rate_select"} 340
+# TYPE qos_rate_used gauge
+qos_rate_used{datname="appdb",rolname="app_user",kind="select"} 3
+# TYPE qos_rate_window_reset_seconds gauge
+qos_rate_window_reset_seconds{datname="appdb",rolname="app_user",kind="select"} 12.480
+```
+
+Label values are escaped, so role and database names containing quotes or
+backslashes cannot break the scrape.
+
+For `postgres_exporter`, either scrape that function or read the views
+directly via a custom query file:
+
+```yaml
+# queries.yaml
+qos_stat:
+  query: "SELECT datname, rolname, total_statements, rejected_total,
+                 rate_select_violations, concurrent_select_violations
+          FROM qos_stat"
+  metrics:
+    - datname:                      {usage: "LABEL"}
+    - rolname:                      {usage: "LABEL"}
+    - total_statements:             {usage: "COUNTER"}
+    - rejected_total:               {usage: "COUNTER"}
+    - rate_select_violations:       {usage: "COUNTER"}
+    - concurrent_select_violations: {usage: "COUNTER"}
+
+qos_stat_rate:
+  query: "SELECT datname, rolname, kind, rate_limit, used, window_reset_ms
+          FROM qos_stat_rate WHERE rate_limit IS NOT NULL"
+  metrics:
+    - datname:         {usage: "LABEL"}
+    - rolname:         {usage: "LABEL"}
+    - kind:            {usage: "LABEL"}
+    - rate_limit:      {usage: "GAUGE"}
+    - used:            {usage: "GAUGE"}
+    - window_reset_ms: {usage: "GAUGE"}
+```
+
+### Logging
 
 Increase verbosity temporarily to trace QoS activity:
 
@@ -232,9 +342,9 @@ You’ll see messages when cache is refreshed, CPU workers are adjusted, or limi
 
 ## Upgrading to 1.1
 
-Version 1.1 adds the rate limits and grows the extension's shared memory
-state, so `ALTER EXTENSION` alone is not enough — the new module must be
-loaded by a restarted postmaster:
+1.1 adds the rate limits and the observability views, and grows the shared
+memory state — so `ALTER EXTENSION` alone is not enough, the new module must
+be loaded by a restarted postmaster:
 
 ```bash
 make && sudo make install
@@ -245,8 +355,15 @@ pg_ctl restart          # required: shared memory layout changed
 ALTER EXTENSION qos UPDATE TO '1.1';
 ```
 
-Existing `qos.*` settings are unaffected and no rate limit is active until you
-set one, so the upgrade is behaviour-neutral by default.
+What changes:
+
+- New `qos.max_*_rate` settings (`'<count>/<window>'`). Existing `qos.*`
+  settings are untouched and no rate limit is active until you set one, so
+  enforcement is unchanged by the upgrade itself.
+- New `qos_stat*` views and `qos_prometheus_metrics()`. Counters are collected
+  from the moment the new module loads and reset on every restart.
+- `qos_get_stats()` is dropped — it was a stub that always returned
+  `not implemented yet`; the views replace it.
 
 ## Limitations
 
@@ -272,7 +389,9 @@ Remove from `shared_preload_libraries` and restart the server.
   - `hooks_resource.c`: CPU/memory enforcement + planner hook
   - `hooks_statement.c`: statement-level concurrency tracking
   - `hooks_transaction.c`: transaction-level concurrency tracking
-  - `hooks_rate.c`: time-windowed (rate) limits — token buckets in shared memory
+  - `hooks_rate.c`: time-windowed (rate) limits — fixed window counters in shared memory
+  - `qos_stats.c`: statistics collection and the SQL/Prometheus views
+  - `qos_shmem_slot.c`: shared-memory slot lookup used by the rate limiter and the statistics
   - `qos.c`/`qos.h`: shared memory, catalog reads, helpers
 
 ## License
