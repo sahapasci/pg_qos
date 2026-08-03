@@ -159,7 +159,7 @@ qos_track_transaction_start(void)
 
     /*
      * Rate check runs after the concurrency check so that a transaction
-     * already rejected for concurrency does not burn a token.  On rejection
+     * already rejected for concurrency does not consume a slot.  On rejection
      * we undo our registration before raising, otherwise the slot would stay
      * marked in-transaction for the rest of the session.
      */

@@ -5,10 +5,19 @@
  * "at most N operations per W milliseconds" for transactions and for each
  * statement type, counted per (database, role) across all backends.
  *
- * The algorithm is a token bucket with lazy refill.  Nothing runs
- * periodically - each check adds elapsed * (count / window) tokens before
- * deciding - so the CPU cost of a check is independent of the window length:
- * a 100ms window costs exactly as much as a one hour window.
+ * The algorithm is a fixed window counter: time is cut into <window>-long
+ * slices and each slice allows <count> operations, so "3/50s" means three
+ * operations in every 50 second slice and the whole allowance returns at once
+ * when the slice ends.
+ *
+ * The known trade-off is the boundary effect: <count> operations at the end of
+ * one slice and <count> more at the start of the next put 2x <count> through in
+ * a short span.  A sliding window would avoid that but needs one timestamp per
+ * operation in shared memory, which does not fit a fixed-size slot table.
+ *
+ * Rollover is lazy.  Nothing runs periodically - each check compares now
+ * against the slice it holds - so the CPU cost of a check is independent of
+ * the window length: a 100ms window costs exactly as much as a one hour one.
  *
  * Author:  M.Atif Ceylan
  * Company: AppstoniA OÜ
@@ -29,7 +38,7 @@
 #include "storage/lwlock.h"
 
 /*
- * Backend-local memo of our token bucket indexes, so a check does not rescan
+ * Backend-local memo of our counter indexes, so a check does not rescan
  * the slot array.  Managed by qos_find_or_create_slot().
  */
 static QoSSlotCache rate_slot_cache = QOS_SLOT_CACHE_INIT;
@@ -71,30 +80,31 @@ qos_rate_now_us(void)
 }
 
 /*
- * Initialise a freshly claimed bucket.
+ * Initialise a freshly claimed counter.
  *
- * A new bucket starts FULL, the standard token bucket convention: an idle
- * system has its whole burst allowance available.  Starting empty would
- * reject the very first statement after a limit is configured and make every
- * fresh bucket behave as an outage.
+ * The first window starts now with the full allowance unspent: an idle system
+ * has all of it available.  Starting the counter part-used would reject the
+ * very first statement after a limit is configured and make every fresh entry
+ * behave as an outage.
  */
 static void
 qos_rate_init_entry(void *entry, void *arg)
 {
     QoSRateEntry *e = (QoSRateEntry *) entry;
-    int initial_tokens = *(int *) arg;
 
-    e->tokens = (double) initial_tokens;
-    e->last_refill_us = qos_rate_now_us();
+    (void) arg;
+
+    e->window_start_us = qos_rate_now_us();
+    e->used = 0;
     e->rejected = 0;
 }
 
 /*
- * Consume one token for `kind` under the limit `count` per `window_ms`.
+ * Count one operation of `kind` against the limit `count` per `window_ms`.
  *
- * Returns true when the operation is allowed (a token was consumed), false
- * when the limit is exhausted.  On rejection *retry_after_ms, if supplied, is
- * set to how long the caller would have to wait for one token.
+ * Returns true when the operation is allowed (the counter was incremented),
+ * false when the current window is used up.  On rejection *retry_after_ms, if
+ * supplied, is set to how long is left until the window resets.
  *
  * Fails open: if shared state or a slot is unavailable the operation is
  * allowed, so a full slot table can never wedge a production workload.
@@ -107,7 +117,7 @@ qos_rate_check(int kind, int count, int window_ms, int *retry_after_ms)
     QoSRateEntry *e;
     int64 now;
     int64 elapsed;
-    double tokens_per_us;
+    int64 window_us;
     bool allowed;
 
     if (retry_after_ms)
@@ -125,7 +135,7 @@ qos_rate_check(int kind, int count, int window_ms, int *retry_after_ms)
                                    MyDatabaseId, GetUserId(), kind,
                                    qos_shared_state->rate_locks,
                                    QOS_RATE_LOCK_STRIPES,
-                                   qos_rate_init_entry, &count,
+                                   qos_rate_init_entry, NULL,
                                    &rate_slot_cache, "rate limiter");
     if (slot < 0)
         return true;    /* fail open */
@@ -133,40 +143,50 @@ qos_rate_check(int kind, int count, int window_ms, int *retry_after_ms)
     e = &qos_shared_state->rate_slots[slot].entry;
     lock = &qos_shared_state->rate_locks[slot % QOS_RATE_LOCK_STRIPES].lock;
 
-    tokens_per_us = (double) count / ((double) window_ms * 1000.0);
+    window_us = (int64) window_ms * 1000;
 
     LWLockAcquire(lock, LW_EXCLUSIVE);
 
     now = qos_rate_now_us();
-    elapsed = now - e->last_refill_us;
+    elapsed = now - e->window_start_us;
 
-    /* Lazy refill.  elapsed < 0 should be impossible with a monotonic clock,
-     * but guard anyway rather than hand out tokens for negative time. */
-    if (elapsed > 0)
-        e->tokens += (double) elapsed * tokens_per_us;
-    e->last_refill_us = now;
-
-    /* Burst ceiling: a bucket never banks more than one window's worth */
-    if (e->tokens > (double) count)
-        e->tokens = (double) count;
-
-    if (e->tokens >= 1.0)
+    if (elapsed < 0)
     {
-        e->tokens -= 1.0;
+        /* Impossible with a monotonic clock, but restart rather than let a
+         * window stretch to the far future if one ever does go backwards. */
+        e->window_start_us = now;
+        e->used = 0;
+    }
+    else if (elapsed >= window_us)
+    {
+        /*
+         * Advance by whole windows instead of snapping the start to now: that
+         * keeps the slices on the grid laid down by the first operation, so a
+         * steady stream of traffic cannot drag the boundary forward and turn
+         * the window into a rolling one.
+         */
+        e->window_start_us += (elapsed / window_us) * window_us;
+        e->used = 0;
+    }
+
+    if (e->used < (uint32) count)
+    {
+        e->used++;
         allowed = true;
     }
     else
     {
-        double missing = 1.0 - e->tokens;
-
         e->rejected++;
         allowed = false;
 
         if (retry_after_ms)
         {
-            double wait_ms = missing / tokens_per_us / 1000.0;
+            int64 remaining_us = e->window_start_us + window_us - now;
 
-            *retry_after_ms = (wait_ms < 1.0) ? 1 : (int) (wait_ms + 0.5);
+            /* Round up: reporting the truncated value would send the client
+             * back a hair too early, into the same exhausted window. */
+            *retry_after_ms = (remaining_us <= 1000)
+                ? 1 : (int) ((remaining_us + 999) / 1000);
         }
     }
 

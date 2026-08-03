@@ -8,7 +8,7 @@
  *   with its neighbours, so no lock is taken on the hot path.
  *
  *   Reporting  - set-returning functions over the shared state (live backend
- *   activity, token buckets, CPU affinity, cumulative counters) plus a
+ *   activity, rate limit windows, CPU affinity, cumulative counters) plus a
  *   Prometheus exposition-format renderer.  These return OIDs; name
  *   resolution happens in the SQL views, following the pg_stat_statements
  *   userid/dbid convention.
@@ -202,7 +202,7 @@ qos_reset_stats(PG_FUNCTION_ARGS)
             qos_stat_reset_entry(e);
     }
 
-    /* Rejection counters kept alongside the token buckets */
+    /* Rejection counters kept alongside the rate limit windows */
     for (i = 0; i < QOS_MAX_RATE_ENTRIES; i++)
     {
         QoSRateEntry *r = &qos_shared_state->rate_slots[i].entry;
@@ -282,35 +282,48 @@ qos_lookup_name(Oid oid, bool is_database)
 }
 
 /*
- * Current token level for a bucket.
+ * Current window state for a rate limit entry.
  *
- * The stored value is only refreshed when a check runs, so an idle bucket
- * would read as empty even though it has recovered.  Apply the same lazy
- * refill qos_rate_check() would, and clamp to the limit, so the reported
- * gauge is the level a statement arriving now would actually see.
+ * The stored counter is only rolled over when a check runs, so an idle entry
+ * would read as used up even though its window has long expired.  Apply the
+ * same rollover qos_rate_check() would - without writing to shared memory -
+ * so the reported numbers are what a statement arriving now would meet.
  */
-static double
-qos_stat_current_tokens(const QoSRateEntry *e, int count, int window_ms)
+static void
+qos_stat_window_state(const QoSRateEntry *e, int window_ms,
+                      uint32 *used, int *reset_ms)
 {
     instr_time now;
     int64 now_us;
+    int64 window_us;
     int64 elapsed;
-    double tokens = e->tokens;
+    int64 remaining_us;
 
-    if (count <= 0 || window_ms <= 0)
-        return tokens;
+    if (window_ms <= 0)
+    {
+        *used = e->used;
+        *reset_ms = 0;
+        return;
+    }
 
     INSTR_TIME_SET_CURRENT(now);
     now_us = (int64) INSTR_TIME_GET_MICROSEC(now);
 
-    elapsed = now_us - e->last_refill_us;
-    if (elapsed > 0)
-        tokens += (double) elapsed * ((double) count / ((double) window_ms * 1000.0));
+    window_us = (int64) window_ms * 1000;
+    elapsed = now_us - e->window_start_us;
 
-    if (tokens > (double) count)
-        tokens = (double) count;
+    if (elapsed < 0 || elapsed >= window_us)
+    {
+        /* Window has expired: the next statement starts a fresh one */
+        *used = 0;
+        *reset_ms = window_ms;
+        return;
+    }
 
-    return tokens;
+    remaining_us = window_us - elapsed;
+
+    *used = e->used;
+    *reset_ms = (int) ((remaining_us + 999) / 1000);
 }
 
 static const char *
@@ -432,11 +445,13 @@ qos_stat_rate(PG_FUNCTION_ARGS)
     for (i = 0; i < QOS_MAX_RATE_ENTRIES; i++)
     {
         QoSRateEntry *e = &qos_shared_state->rate_slots[i].entry;
-        Datum values[6];
-        bool nulls[6] = {0};
+        Datum values[7];
+        bool nulls[7] = {0};
         QoSLimits limits;
         int count;
         int window_ms;
+        uint32 used;
+        int reset_ms;
         LWLock *lock;
         QoSRateEntry snapshot;
 
@@ -449,8 +464,8 @@ qos_stat_rate(PG_FUNCTION_ARGS)
             continue;
 
         /*
-         * Take a consistent snapshot of tokens and last_refill_us: they are
-         * two fields updated together under the bucket's lock, and refilling
+         * Take a consistent snapshot of used and window_start_us: they are
+         * two fields updated together under the entry's lock, and rolling over
          * from a mismatched pair would report a nonsense level.
          */
         lock = &qos_shared_state->rate_locks[i % QOS_RATE_LOCK_STRIPES].lock;
@@ -470,17 +485,27 @@ qos_stat_rate(PG_FUNCTION_ARGS)
 
         if (count > 0)
         {
+            qos_stat_window_state(&snapshot, window_ms, &used, &reset_ms);
+
             values[3] = Int32GetDatum(count);
             values[4] = Int32GetDatum(window_ms);
+            values[6] = Int32GetDatum(reset_ms);
         }
         else
         {
-            /* Bucket exists but the limit has since been removed */
+            /*
+             * The entry exists but the limit has since been removed: without a
+             * window there is nothing to roll over against, so report the
+             * stored counter as-is and leave the window columns NULL.
+             */
+            used = snapshot.used;
+
             nulls[3] = true;
             nulls[4] = true;
+            nulls[6] = true;
         }
 
-        values[5] = Float8GetDatum(qos_stat_current_tokens(&snapshot, count, window_ms));
+        values[5] = Int32GetDatum((int32) used);
 
         tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
     }
@@ -663,13 +688,15 @@ qos_prometheus_metrics(PG_FUNCTION_ARGS)
                                             pg_atomic_read_u64(&e->work_mem_violations)));
     }
 
-    /* --- live token buckets --- */
+    /* --- live rate limit windows --- */
 
     appendStringInfoString(&buf,
-        "# HELP qos_rate_tokens_available Tokens a statement arriving now would find\n"
-        "# TYPE qos_rate_tokens_available gauge\n"
+        "# HELP qos_rate_used Operations counted in the current window\n"
+        "# TYPE qos_rate_used gauge\n"
         "# HELP qos_rate_limit Configured operations per window\n"
-        "# TYPE qos_rate_limit gauge\n");
+        "# TYPE qos_rate_limit gauge\n"
+        "# HELP qos_rate_window_reset_seconds Time left until the window resets\n"
+        "# TYPE qos_rate_window_reset_seconds gauge\n");
 
     for (i = 0; i < QOS_MAX_RATE_ENTRIES; i++)
     {
@@ -681,6 +708,8 @@ qos_prometheus_metrics(PG_FUNCTION_ARGS)
         char *rolname;
         int count;
         int window_ms;
+        uint32 used;
+        int reset_ms;
 
         if (e->database_oid == InvalidOid)
             continue;
@@ -706,13 +735,17 @@ qos_prometheus_metrics(PG_FUNCTION_ARGS)
         datname = qos_lookup_name(snapshot.database_oid, true);
         rolname = qos_lookup_name(snapshot.role_oid, false);
 
-        qos_append_labelled_metric(&buf, "qos_rate_tokens_available", datname, rolname,
+        qos_stat_window_state(&snapshot, window_ms, &used, &reset_ms);
+
+        qos_append_labelled_metric(&buf, "qos_rate_used", datname, rolname,
                                    "kind", qos_kind_label(snapshot.kind),
-                                   psprintf("%.3f",
-                                            qos_stat_current_tokens(&snapshot, count, window_ms)));
+                                   psprintf("%u", used));
         qos_append_labelled_metric(&buf, "qos_rate_limit", datname, rolname,
                                    "kind", qos_kind_label(snapshot.kind),
                                    psprintf("%d", count));
+        qos_append_labelled_metric(&buf, "qos_rate_window_reset_seconds", datname, rolname,
+                                   "kind", qos_kind_label(snapshot.kind),
+                                   psprintf("%.3f", (double) reset_ms / 1000.0));
     }
 
     /* --- live activity --- */

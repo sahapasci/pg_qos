@@ -113,11 +113,15 @@ typedef union QoSStatSlot
 #define QOS_STAT_LOCK_STRIPES   8
 
 /*
- * Token-bucket state for one (database, role, kind) triple.
+ * Fixed-window counter state for one (database, role, kind) triple.
  *
- * Refill is lazy: nothing runs periodically, each check adds
- * elapsed * (count / window) tokens before deciding.  That makes the cost of
- * a check independent of the window length.
+ * "<count>/<window>" means: at most <count> operations in each <window>-long
+ * slice of time.  The counter resets when a slice ends, so the whole allowance
+ * becomes available at once rather than trickling back in.
+ *
+ * Rollover is lazy: nothing runs periodically, each check compares now against
+ * window_start_us and zeroes `used` if the slice has expired.  That makes the
+ * cost of a check independent of the window length.
  *
  * Padded to a cache line because every backend sharing a (db, role) writes
  * the same entry on every statement; without padding neighbouring entries
@@ -128,8 +132,8 @@ typedef struct QoSRateEntry
     Oid     database_oid;       /* InvalidOid = free slot */
     Oid     role_oid;
     int     kind;               /* QoSRateKind */
-    double  tokens;             /* Currently available tokens */
-    int64   last_refill_us;     /* MONOTONIC microseconds, not wall clock */
+    int64   window_start_us;    /* MONOTONIC microseconds, not wall clock */
+    uint32  used;               /* Operations counted in the current window */
     uint64  rejected;
 } QoSRateEntry;
 

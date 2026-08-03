@@ -165,7 +165,7 @@ qos_pick_min_rate(int *out_count, int *out_window,
  * Resolve the effective limits for an arbitrary (role, database) pair.
  *
  * Callable for any pair, not just the current session: the statistics views
- * use it to report the limit alongside each token bucket, and it works across
+ * use it to report the limit alongside each rate limit window, and it works across
  * databases because pg_db_role_setting is a shared catalog.
  */
 void
@@ -260,11 +260,11 @@ qos_refresh_cached_limits(void)
     qos_compute_effective_limits(current_user_id, current_db_id, &cached_limits);
 
     /*
-     * Note: token buckets in shared memory are intentionally NOT reset here.
-     * They are keyed by (db, role, kind), not by the limit value, and
-     * qos_rate_check() clamps banked tokens to the current count - so
-     * lowering a limit takes effect on the very next check without losing
-     * the shared state other backends are using.
+     * Note: rate limit counters in shared memory are intentionally NOT reset
+     * here.  They are keyed by (db, role, kind), not by the limit value, and
+     * qos_rate_check() compares `used` against whatever count is in force at
+     * the time - so lowering a limit takes effect on the very next check
+     * without losing the shared state other backends are using.
      */
 
     /* Update cache metadata */

@@ -84,11 +84,12 @@ AS '$libdir/qos', 'qos_stat_activity';
 CREATE VIEW qos_stat_activity AS SELECT * FROM qos_stat_activity();
 
 -- ---------------------------------------------------------------------------
--- Live token buckets
+-- Live rate limit windows
 --
--- tokens_available is the level a statement arriving now would find: the
--- stored value is refreshed lazily, so it is refilled before being reported.
--- rate_limit is NULL when a bucket outlives the setting that created it.
+-- used and window_reset_ms describe the window a statement arriving now would
+-- meet: rollover is lazy, so an expired window is reported as already reset.
+-- rate_limit, window_ms and window_reset_ms are NULL when an entry outlives
+-- the setting that created it.
 -- ---------------------------------------------------------------------------
 CREATE FUNCTION qos_stat_rate(
     OUT datname             text,
@@ -96,7 +97,8 @@ CREATE FUNCTION qos_stat_rate(
     OUT kind                text,
     OUT rate_limit          int,
     OUT window_ms           int,
-    OUT tokens_available    float8
+    OUT used                int,
+    OUT window_reset_ms     int
 )
 RETURNS SETOF record
 LANGUAGE C STRICT VOLATILE PARALLEL SAFE
@@ -163,5 +165,5 @@ GRANT SELECT ON qos_stat_cpu TO pg_monitor;
 COMMENT ON FUNCTION qos_prometheus_metrics() IS 'QoS metrics in Prometheus exposition format';
 COMMENT ON VIEW qos_stat IS 'Cumulative QoS counters per database and role (reset on restart)';
 COMMENT ON VIEW qos_stat_activity IS 'Backends currently tracked by QoS';
-COMMENT ON VIEW qos_stat_rate IS 'Live rate limit token buckets';
+COMMENT ON VIEW qos_stat_rate IS 'Live rate limit windows';
 COMMENT ON VIEW qos_stat_cpu IS 'CPU cores assigned per database and role';

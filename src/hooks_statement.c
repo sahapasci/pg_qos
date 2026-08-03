@@ -163,7 +163,7 @@ qos_track_statement_start(CmdType operation)
 
         /*
          * Rate check runs after the concurrency check so that a statement
-         * already rejected for concurrency does not burn a token.  On
+         * already rejected for concurrency does not consume a slot.  On
          * rejection we undo our registration first, otherwise the slot would
          * stay marked as running this command type.
          */

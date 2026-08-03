@@ -359,7 +359,7 @@ qos_lookup_rate_param(const char *name, int *kind)
  * ms/s/min suffix.  A bare number is interpreted as milliseconds.
  *
  * The lower bound exists to stop nonsensical configurations, not for
- * performance reasons: token-bucket refill is lazy, so a 100ms window costs
+ * performance reasons: window rollover is lazy, so a 100ms window costs
  * exactly as much CPU per check as a 1 hour window.
  *
  * display_value is the full "<count>/<window>" the user wrote; error messages
