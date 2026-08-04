@@ -29,21 +29,21 @@ and to prevent complicating maintenance/administration processes by eliminating 
 ### Debian 13 Package
 ```bash
 # Install
-sudo dpkg -i postgresql-<version>-qos_1.0.0-1_debian13_amd64.deb
+sudo dpkg -i postgresql-<version>-qos_1.1.0-1_debian13_amd64.deb
 sudo apt-get install -f
 ```
 
 ### Ubuntu 24.04 Package
 ```bash
 # Install
-sudo dpkg -i postgresql-<version>-qos_1.0.0-1-ubuntu24_amd64.deb
+sudo dpkg -i postgresql-<version>-qos_1.1.0-1-ubuntu24_amd64.deb
 sudo apt-get install -f
 ```
 
 ### RHEL/AlmaLinux/Centos 10 (PGDG) Package
 ```bash
 # Install
-sudo rpm -i postgresql<version>-qos-1.0.0-1.el10.x86_64.rpm
+sudo rpm -i postgresql<version>-qos-1.1.0-1.el10.x86_64.rpm
 ```
 
 ## Installation From Source

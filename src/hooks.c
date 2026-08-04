@@ -11,7 +11,7 @@
  * Author:  M.Atif Ceylan
  * Company: AppstoniA OÜ
  * Created: October 02, 2025
- * Version: 1.0
+ * Version: 1.1
  * License: See LICENSE file in the project root
  *
  * Copyright (c) 2025 AppstoniA OÜ
