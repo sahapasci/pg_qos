@@ -25,6 +25,9 @@
 #include "utils/guc.h"
 #include <strings.h>
 #include <unistd.h>
+#include <fmgr.h>
+#include "utils/fmgrprotos.h"
+#include "utils/builtins.h"
 
 #ifdef __linux__
 #include <sched.h>
@@ -35,6 +38,7 @@
 #include <sys/ioctl.h>
 #include <errno.h>
 #endif
+
 
 /* Forward declarations */
 static void qos_adjust_parallel_workers(Plan *plan, int max_workers);
@@ -551,6 +555,9 @@ qos_enforce_work_mem_limit(VariableSetStmt *stmt)
             /* Check if new value exceeds limit */
             if (new_work_mem_bytes > limits.work_mem_limit)
             {
+                Datum d_new_work_mem_bytes;
+                Datum d_limits_work_mem_limit;
+
                 int elevel = (limits.work_mem_error_level == QOS_WORK_MEM_ERROR_ERROR)
                               ? ERROR
                               : WARNING;
@@ -563,12 +570,18 @@ qos_enforce_work_mem_limit(VariableSetStmt *stmt)
 
                 qos_stat_count_rejection(QOS_REJECT_WORK_MEM, -1);
                 
+                d_new_work_mem_bytes = DirectFunctionCall1(pg_size_pretty,
+                              Int64GetDatum(new_work_mem_bytes));
+                d_limits_work_mem_limit = DirectFunctionCall1(pg_size_pretty,
+                              Int64GetDatum(limits.work_mem_limit));
+
                 ereport(elevel,
                         (errcode(ERRCODE_INSUFFICIENT_RESOURCES),
                          errmsg("qos: work_mem limit exceeded"),
-                         errdetail("Requested %ld KB, maximum allowed is %ld KB",
-                                  new_work_mem_bytes / 1024, limits.work_mem_limit / 1024),
-                         errhint("Contact administrator to increase qos.work_mem_limit")));
+                         errdetail("Requested %s, maximum allowed is %s",
+                                  TextDatumGetCString(d_new_work_mem_bytes), 
+                                  TextDatumGetCString(d_limits_work_mem_limit)),
+                         errhint("Increase 'qos.work_mem_limit' if you are a superuser; otherwise, contact your database administrator.")));
             }
         }
     }
