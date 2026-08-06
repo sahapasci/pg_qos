@@ -1,14 +1,30 @@
+# Object / libraries
 *.o
+*.lo
+*.a
+*.la
 *.so
 *.dylib
-*.lo
-*.la
-*.a
+*.bc
+
+# Python
 *.pyc
-.DS_Store
-build.sh
-.vscode/
+
+# Build outputs
+build*
+*.buildinfo
+debug/
+release/
+
+# Packaging
 debian/
 rhel/
-*.buildinfo
-build*
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+
+# Project-specific
+build.sh
