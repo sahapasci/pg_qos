@@ -203,7 +203,7 @@ rates, so `10/1s` (10/sec) wins over `100/500ms` (200/sec).
 ## How it works
 
 - Work_mem enforcement
-  - Intercepts `SET work_mem` and rejects values above `qos.work_mem_limit`.
+  - Intercepts `SET work_mem` and rejects values above `qos.work_mem_limit`. For existing sessions, increasing `qos.work_mem_limit` does not modify the current `work_mem` value. Decreasing `qos.work_mem_limit` below the current `work_mem` immediately updates the session's `work_mem` to the new limit.
 
 - CPU limiting
   - On Linux, QoS binds the backend to the N CPU cores (CPU affinity) to cap total CPU usage.
